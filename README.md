@@ -184,6 +184,11 @@ Current method: manual labeling
 
 # 4. Software Architecture
 
+```
+conda create -n joint_jig python=3.11 pymodbus=3.9.2 pyserial=3.5 pip -c conda-forge
+conda activate joint_jig
+```
+
 ## 4.1 Supervisory Control Software (Python)
 
 Runs on PC and communicates via RS-485 USB adapters to:
@@ -249,13 +254,26 @@ JSON acts as interface between design and production.
 ```
 # 6. Configuration File
 
-Separate settings file (settings.json) defines:
+Control Software settings file (settings.json) defines:
 
 - Distance sensor offset
 - Tolerance threshold (default ±2 mm)
 - Gearbox ratio
 - Motor step resolution
 - Joint-type-specific offsets
+
+Hardware Settings (Distance Sensor)
+
+- Baud Rate = 115200
+- RS485 Address = 01
+
+Hardware Settings (ZDT X42S V1.0 FOC Stepper Motor)
+
+- Driver Type = Emm
+- Baud Rate = 115200
+- RS485 Address = 02
+- Checksum = ModBus
+
 
 # 7. Production Logging
 
