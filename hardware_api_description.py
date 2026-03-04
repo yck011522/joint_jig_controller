@@ -1,4 +1,22 @@
 # ==========================================================
+# Modbus RTU hardware Serial Interface
+# Main App needs to create a single ModbusSerialClient and pass it to each device interface class
+# ==========================================================
+
+from pymodbus.client import ModbusSerialClient
+
+client = ModbusSerialClient(
+    port="COM3",
+    baudrate=115200,
+    parity="N",
+    stopbits=1,
+    bytesize=8,
+    timeout=0.4
+)
+
+client.connect()
+
+# ==========================================================
 # Distance Sensor Interface
 # File: distance_sensor.py
 # Device: JK-LRD laser distance sensor
@@ -74,6 +92,7 @@ motor.zero_here()
 
 
 # Moves the output shaft by a relative angle in degrees
+deg = 45.0
 motor.move_relative_deg_output(deg)
 
 
