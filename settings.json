@@ -1,0 +1,79 @@
+{
+    "settings_version": 1,
+    "serial": {
+        "baudrate": 115200,
+        "timeout_s": 0.2
+    },
+    "device_addresses": {
+        "motor_addr": 1,
+        "sensor_addr": 2
+    },
+    "probe": {
+        "enabled": true,
+        "max_ports_to_try": 50,
+        "retries_per_port": 2
+    },
+    "motion": {
+        "gear_ratio": 30.0,
+        "motor_steps_per_rev": 200,
+        "microsteps": 16,
+        "rot_speed_deg_s": 60.0,
+        "rot_tol_deg": 1.0
+    },
+    "linear": {
+        "linear_tol_mm": 2.0,
+        "sensor_global_offset_mm": 0.0,
+        "joint_offsets": [
+            {
+                "type": "T20-5-M",
+                "ori": "L",
+                "offset_mm": 0.0
+            },
+            {
+                "type": "T20-5-M",
+                "ori": "R",
+                "offset_mm": 0.0
+            },
+            {
+                "type": "T20-5-F",
+                "ori": "L",
+                "offset_mm": 0.0
+            },
+            {
+                "type": "T20-5-F",
+                "ori": "R",
+                "offset_mm": 0.0
+            }
+        ]
+    },
+    "images": {
+        "base_dir": "images",
+        "joint_images": [
+            {
+                "type": "T20-5-M",
+                "ori": "L",
+                "rel_path": "T20-5-M_L.jpg"
+            },
+            {
+                "type": "T20-5-M",
+                "ori": "R",
+                "rel_path": "T20-5-M_R.jpg"
+            },
+            {
+                "type": "T20-5-F",
+                "ori": "L",
+                "rel_path": "T20-5-F_L.jpg"
+            },
+            {
+                "type": "T20-5-F",
+                "ori": "R",
+                "rel_path": "T20-5-F_R.jpg"
+            }
+        ]
+    },
+    "logging": {
+        "enabled": true,
+        "log_extension": ".log.jsonl",
+        "flush_each_event": true
+    }
+}
