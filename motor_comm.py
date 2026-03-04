@@ -211,6 +211,51 @@ class ZDTEmmMotor:
         self.move_relative_pulses_motor(pulses, speed_rpm=speed_rpm, acc=acc, sync=sync, motion_mode=0)
         return pulses
 
+    def move_absolute_pulses_motor(
+        self,
+        target_pulses_motor: int,
+        *,
+        speed_rpm: int = 200,
+        acc: int = 50,
+        sync: int = 0,
+    ) -> None:
+        """
+        Moves to an *absolute* target position given in motor pulses.
+
+        Uses the same Emm position-mode control block, but motion_mode=1 (absolute).
+        """
+        self.move_relative_pulses_motor(
+            pulses_motor=int(target_pulses_motor),
+            speed_rpm=speed_rpm,
+            acc=acc,
+            sync=sync,
+            motion_mode=1,  # absolute
+        )
+
+    def move_absolute_deg_output(
+        self,
+        target_deg_output: float,
+        *,
+        speed_rpm: int = 200,
+        acc: int = 50,
+        sync: int = 0,
+    ) -> int:
+        """
+        Moves the *output shaft* to an absolute target angle in degrees.
+
+        Returns the integer motor pulses commanded as the absolute target.
+        """
+        target_pulses = int(round(float(target_deg_output) * self.kin.pulses_per_output_deg))
+        # motor_rpm = int(round(float(speed_rpm) * self.kin.gearbox_ratio))
+        self.move_absolute_pulses_motor(
+            target_pulses,
+            speed_rpm=speed_rpm,
+            acc=acc,
+            sync=sync,
+        )
+        return target_pulses
+
+
     def wait_until_reached(self, *, timeout_s: float = 10.0) -> bool:
         """
         Polls Prf_TF until reached or timeout. :contentReference[oaicite:18]{index=18}
@@ -261,25 +306,30 @@ def _demo():
         print("[demo] zero_here() ...")
         motor.zero_here()
 
-        # Move +360° output, wait, then back to 0 (i.e., -360° relative)
-        print("[demo] move +360deg output ...")
-        pulses = motor.move_relative_deg_output(+360.0, speed_rpm=500, acc=500)
+        # Move to +360° output (absolute)
+        print("[demo] move to +360deg output (absolute) ...")
+        motor.move_absolute_deg_output(+360.0, speed_rpm=200, acc=50)
         ok = motor.wait_until_reached(timeout_s=20.0)
+
+        # Read back the position in both motor and output degrees
         motor_deg = motor.read_realtime_position_deg_motor()
         out_deg = motor.read_realtime_position_deg_output()
         print(
-            f"[demo] commanded pulses_motor={pulses} reached={ok} "
+            f"[demo] commanded reached={ok} "
             f"motor_deg_now={motor_deg:.3f}  output_deg_now={out_deg:.3f}"
         )
         time.sleep(0.3)
 
-        print("[demo] move -360deg output ...")
-        pulses = motor.move_relative_deg_output(-360.0, speed_rpm=500, acc=500)
+        # Move back to 0° output (absolute)
+        print("[demo] move back to 0deg output (absolute) ...")
+        motor.move_absolute_deg_output(0.0, speed_rpm=200, acc=50)
         ok = motor.wait_until_reached(timeout_s=20.0)
+
+        # Read back the position in both motor and output degrees
         motor_deg = motor.read_realtime_position_deg_motor()
         out_deg = motor.read_realtime_position_deg_output()
         print(
-            f"[demo] commanded pulses_motor={pulses} reached={ok} "
+            f"[demo] commanded reached={ok} "
             f"motor_deg_now={motor_deg:.3f}  output_deg_now={out_deg:.3f}"
         )
         print("[demo] done.")

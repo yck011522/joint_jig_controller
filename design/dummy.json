@@ -1,0 +1,47 @@
+{
+    "schema_version": 1,
+    "units": "mm",
+    "tubes": [
+        {
+            "id": "T1",
+            "length": 1000,
+            "outer_diameter": 20.0,
+            "wall_thickness": 2.0,
+            "material": "Aluminum 6061",
+            "joints": [
+                {
+                    "id": "J1-4",
+                    "type": "T20-5-M",
+                    "ori": "L",
+                    "s_on_tube": 120,
+                    "roll_deg": 0,
+                    "notes": "First joint at 120mm"
+                },
+                {
+                    "id": "J002",
+                    "type": "T20-5-F",
+                    "ori": "L",
+                    "s_on_tube": 320,
+                    "roll_deg": 45,
+                    "notes": "Second Joint"
+                },
+                {
+                    "id": "J003",
+                    "type": "T20-5-M",
+                    "ori": "R",
+                    "s_on_tube": 580,
+                    "roll_deg": 90,
+                    "notes": "More joints"
+                },
+                {
+                    "id": "J004",
+                    "type": "T20-5-F",
+                    "ori": "R",
+                    "s_on_tube": 860,
+                    "roll_deg": 135,
+                    "notes": "Details about the last joint"
+                }
+            ]
+        }
+    ]
+}

@@ -2,11 +2,12 @@
     "settings_version": 1,
     "serial": {
         "baudrate": 115200,
-        "timeout_s": 0.2
+        "timeout_s": 0.2,
+        "port" : "COM3"
     },
     "device_addresses": {
-        "motor_addr": 1,
-        "sensor_addr": 2
+        "motor_addr": 2,
+        "sensor_addr": 1
     },
     "probe": {
         "enabled": true,
@@ -17,7 +18,8 @@
         "gear_ratio": 30.0,
         "motor_steps_per_rev": 200,
         "microsteps": 16,
-        "rot_speed_deg_s": 60.0,
+        "rot_speed_rpm": 30.0,
+        "rot_acc_rpm_s": 100.0,
         "rot_tol_deg": 1.0
     },
     "linear": {
