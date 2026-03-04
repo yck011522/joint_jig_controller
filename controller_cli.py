@@ -214,8 +214,8 @@ def main():
     tube_length = float(tube.get("length", 0.0))
     joints = list(tube.get("joints", []) or [])
 
-    # Sort joints by s_on_tube (left->right)
-    joints.sort(key=lambda j: float(j.get("s_on_tube", 0.0)))
+    # Sort joints by dist_on_tube (left->right)
+    joints.sort(key=lambda j: float(j.get("dist_on_tube", 0.0)))
 
     # --- Offset completeness enforcement (before starting assembly) ---
     offset_map = build_offset_map(settings)
@@ -262,16 +262,16 @@ def main():
         joint_id = str(j.get("id", f"joint_{joint_seq}"))
         joint_type = str(j.get("type", "")).strip()
         ori = str(j.get("ori", "")).strip()
-        s_on_tube = float(j.get("s_on_tube", 0.0))
+        dist_on_tube = float(j.get("dist_on_tube", 0.0))
         roll_deg = float(j.get("roll_deg", 0.0))
 
         # Compute target position (design truth + offsets)
         joint_offset = offset_map[(joint_type, ori)]
-        target_mm = s_on_tube + sensor_global_offset_mm + joint_offset
+        target_mm = dist_on_tube + sensor_global_offset_mm + joint_offset
 
         print("\n" + "-" * 60)
         print(f"Joint {joint_seq+1}/{len(joints)} | id={joint_id} | type={joint_type} ori={ori}")
-        print(f"Target: s_on_tube={s_on_tube:.1f}mm  -> target_mm={target_mm:.1f}mm (global+joint offsets applied)")
+        print(f"Target: dist_on_tube={dist_on_tube:.1f}mm  -> target_mm={target_mm:.1f}mm (global+joint offsets applied)")
         print(f"Target rotation: roll_deg={roll_deg:.1f}°")
 
         # POSITIONING_J1_LINEAR

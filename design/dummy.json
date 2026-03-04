@@ -13,7 +13,7 @@
                     "id": "J1-4",
                     "type": "T20-5-M",
                     "ori": "L",
-                    "s_on_tube": 120,
+                    "dist_on_tube": 120,
                     "roll_deg": 0,
                     "notes": "First joint at 120mm"
                 },
@@ -21,7 +21,7 @@
                     "id": "J002",
                     "type": "T20-5-F",
                     "ori": "L",
-                    "s_on_tube": 320,
+                    "dist_on_tube": 320,
                     "roll_deg": 45,
                     "notes": "Second Joint"
                 },
@@ -29,7 +29,7 @@
                     "id": "J003",
                     "type": "T20-5-M",
                     "ori": "R",
-                    "s_on_tube": 580,
+                    "dist_on_tube": 580,
                     "roll_deg": 90,
                     "notes": "More joints"
                 },
@@ -37,7 +37,7 @@
                     "id": "J004",
                     "type": "T20-5-F",
                     "ori": "R",
-                    "s_on_tube": 860,
+                    "dist_on_tube": 860,
                     "roll_deg": 135,
                     "notes": "Details about the last joint"
                 }
