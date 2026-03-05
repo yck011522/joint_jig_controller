@@ -17,8 +17,8 @@ Mount tube, then press Enter to START (will zero motor here)...
 
 ------------------------------------------------------------
 Joint 1/4 | id=J1-4 | type=T20-5-M ori=L
-Target: dist_on_tube=120.0mm  -> target_mm=120.0mm (global+joint offsets applied)
-Target rotation: roll_deg=0.0°
+Target: position_mm=120.0mm  -> target_mm=120.0mm (global+joint offsets applied)
+Target rotation: rotation_deg=0.0°
 
 Move carriage to target. Press ENTER to attempt confirm (non-blocking on Windows).
 Live: current_mm_raw | measured_mm | target_mm | error_mm
@@ -31,8 +31,8 @@ Install joint now: type=T20-5-M ori=L. Press ENTER when installed.
 
 ------------------------------------------------------------
 Joint 2/4 | id=J002 | type=T20-5-F ori=L
-Target: dist_on_tube=320.0mm  -> target_mm=320.0mm (global+joint offsets applied)
-Target rotation: roll_deg=45.0°
+Target: position_mm=320.0mm  -> target_mm=320.0mm (global+joint offsets applied)
+Target rotation: rotation_deg=45.0°
 
 Move carriage to target. Press ENTER to attempt confirm (non-blocking on Windows).
 Live: current_mm_raw | measured_mm | target_mm | error_mm
@@ -45,8 +45,8 @@ Install joint now: type=T20-5-F ori=L. Press ENTER when installed.
 
 ------------------------------------------------------------
 Joint 3/4 | id=J003 | type=T20-5-M ori=R
-Target: dist_on_tube=580.0mm  -> target_mm=580.0mm (global+joint offsets applied)
-Target rotation: roll_deg=90.0°
+Target: position_mm=580.0mm  -> target_mm=580.0mm (global+joint offsets applied)
+Target rotation: rotation_deg=90.0°
 
 Move carriage to target. Press ENTER to attempt confirm (non-blocking on Windows).
 Live: current_mm_raw | measured_mm | target_mm | error_mm
@@ -59,8 +59,8 @@ Install joint now: type=T20-5-M ori=R. Press ENTER when installed.
 
 ------------------------------------------------------------
 Joint 4/4 | id=J004 | type=T20-5-F ori=R
-Target: dist_on_tube=860.0mm  -> target_mm=860.0mm (global+joint offsets applied)
-Target rotation: roll_deg=135.0°
+Target: position_mm=860.0mm  -> target_mm=860.0mm (global+joint offsets applied)
+Target rotation: rotation_deg=135.0°
 
 Move carriage to target. Press ENTER to attempt confirm (non-blocking on Windows).
 Live: current_mm_raw | measured_mm | target_mm | error_mm
