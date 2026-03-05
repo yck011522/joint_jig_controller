@@ -30,6 +30,11 @@ def load_json(path: Path) -> dict:
 
 
 def safe_get(d: dict, keys: list[str], default=None):
+    """Walk a nested dict using *keys* and return the value or *default*.
+
+    This is a tiny helper to avoid ``KeyError``s when the configuration has
+    missing entries; it treats anything that isn't a dict as a dead end.
+    """
     cur = d
     for k in keys:
         if not isinstance(cur, dict) or k not in cur:
@@ -47,35 +52,52 @@ def ensure_schema_version(design: dict, expected: int = 1):
 
 
 def build_offset_map(settings: dict) -> Dict[Tuple[str, str], float]:
-    offsets = safe_get(settings, ["linear", "joint_offsets"], default=[])
-    m: Dict[Tuple[str, str], float] = {}
-    for entry in offsets:
-        t = str(entry.get("type", "")).strip()
-        o = str(entry.get("ori", "")).strip()
-        off = float(entry.get("offset_mm", 0.0))
-        if not t or not o:
+    """Read joint offsets from settings and return a lookup map.
+
+    The returned dictionary maps ``(type, orientation)`` to a float offset in
+    millimetres. Any malformed entries are simply skipped; if duplicates occur
+    the later entry overwrites the earlier one.
+    """
+    joint_offset_entries = safe_get(settings, ["linear", "joint_offsets"], default=[])
+    offset_map: Dict[Tuple[str, str], float] = {}
+    for entry in joint_offset_entries:
+        type_str = str(entry.get("type", "")).strip()
+        orientation = str(entry.get("ori", "")).strip()
+        offset_mm = float(entry.get("offset_mm", 0.0))
+        if not type_str or not orientation:
+            # skip incomplete records
             continue
-        key = (t, o)
+        key = (type_str, orientation)
         # If duplicates exist, last one wins; we can tighten later if needed.
-        m[key] = off
-    return m
+        offset_map[key] = offset_mm
+    return offset_map
 
 
 def required_type_ori_pairs(tube: dict) -> set[Tuple[str, str]]:
-    req: set[Tuple[str, str]] = set()
-    for j in tube.get("joints", []) or []:
-        t = str(j.get("type", "")).strip()
-        o = str(j.get("ori", "")).strip()
-        if t and o:
-            req.add((t, o))
-    return req
+    """Return the set of (type, orientation) pairs required by a tube design.
+
+        Used to verify that we have offsets for every joint described in the
+    design.
+    """
+    required_pairs: set[Tuple[str, str]] = set()
+    for joint in tube.get("joints", []) or []:
+        type_str = str(joint.get("type", "")).strip()
+        orientation = str(joint.get("ori", "")).strip()
+        if type_str and orientation:
+            required_pairs.add((type_str, orientation))
+    return required_pairs
 
 
 def validate_offsets_complete(
     tube: dict, offset_map: Dict[Tuple[str, str], float]
 ) -> None:
-    req = required_type_ori_pairs(tube)
-    missing = sorted([p for p in req if p not in offset_map])
+    """Raise if there are joints described in *tube* without an offset entry.
+
+    The check is performed before any assembly work begins so that the user is
+    alerted early rather than part-way through the workflow.
+    """
+    required_pairs = required_type_ori_pairs(tube)
+    missing = sorted([pair for pair in required_pairs if pair not in offset_map])
     if missing:
         msg = "Missing joint_offsets entries for (type, ori):\n" + "\n".join(
             [f"  - {p}" for p in missing]
@@ -125,7 +147,10 @@ def enter_pressed_nonblocking() -> bool:
 def main():
     base_dir = Path(__file__).resolve().parent
 
-    # --- 1) Load settings.json ---
+    # --- 1) Load settings.json -------------------------------------------------
+    # The CLI is entirely driven by a few JSON configuration files located in
+    # the same directory as the script.  If settings.json is missing we can't
+    # proceed, so fail fast.
     settings_path = base_dir / "settings.json"
     if not settings_path.exists():
         raise RuntimeError(f"settings.json not found next to script: {settings_path}")
@@ -159,8 +184,11 @@ def main():
     print("[init] Modbus connected.")
 
     # --- 3) Instantiate DistanceSensor + ZDTEmmMotor ---
-    motor_addr = int(safe_get(settings, ["device_addresses", "motor_addr"], default=2))
-    sensor_addr = int(
+    # device address configuration for Modbus slaves
+    motor_address = int(
+        safe_get(settings, ["device_addresses", "motor_addr"], default=2)
+    )
+    sensor_address = int(
         safe_get(settings, ["device_addresses", "sensor_addr"], default=1)
     )
 
@@ -171,20 +199,24 @@ def main():
     microsteps = int(safe_get(settings, ["motion", "microsteps"], default=16))
     gear_ratio = float(safe_get(settings, ["motion", "gear_ratio"], default=30.0))
 
-    kin = MotorKinematics(
+    kinematics = MotorKinematics(
         motor_steps_per_rev=motor_steps_per_rev,
         microsteps=microsteps,
         gearbox_ratio=gear_ratio,
     )
 
-    sensor = DistanceSensor(client, slave_id=sensor_addr)
-    motor = ZDTEmmMotor(client, slave_id=motor_addr, kinematics=kin)
+    # create objects for interacting with the hardware
+    sensor = DistanceSensor(client, slave_id=sensor_address)
+    motor = ZDTEmmMotor(client, slave_id=motor_address, kinematics=kinematics)
 
     # Probe connectivity quickly
     try:
-        _mm = sensor.read_mm()
-        _deg = motor.read_realtime_position_deg_output()
-        print(f"[probe] Sensor OK: {_mm} mm | Motor OK: {_deg:.3f} deg (output)")
+        # do a quick read from each device to ensure they're alive
+        sensor_reading_mm = sensor.read_mm()
+        motor_reading_deg = motor.read_realtime_position_deg_output()
+        print(
+            f"[probe] Sensor OK: {sensor_reading_mm} mm | Motor OK: {motor_reading_deg:.3f} deg (output)"
+        )
     except Exception as e:
         client.close()
         raise RuntimeError(
@@ -206,25 +238,26 @@ def main():
         raise RuntimeError("Design file contains no tubes[].")
 
     # --- 5) Choose tube in CLI ---
+    # show available tubes from the design so operator can choose one
     print("\n=== Tube List ===")
-    for i, t in enumerate(tubes):
-        tid = t.get("id", f"tube_{i}")
-        length = t.get("length", "?")
-        n = len(t.get("joints", []) or [])
-        print(f"  [{i}] id={tid}  length={length}mm  joints={n}")
+    for idx, tube_entry in enumerate(tubes):
+        display_id = tube_entry.get("id", f"tube_{idx}")
+        length = tube_entry.get("length", "?")
+        num_joints = len(tube_entry.get("joints", []) or [])
+        print(f"  [{idx}] id={display_id}  length={length}mm  joints={num_joints}")
 
     sel_str = input("Select tube index and press Enter: ").strip()
     if sel_str == "":
-        sel = 0
+        selected_index = 0
     else:
-        sel = int(sel_str)
+        selected_index = int(sel_str)
 
-    if sel < 0 or sel >= len(tubes):
+    if selected_index < 0 or selected_index >= len(tubes):
         client.close()
-        raise RuntimeError(f"Invalid tube selection: {sel}")
+        raise RuntimeError(f"Invalid tube selection: {selected_index}")
 
-    tube = tubes[sel]
-    tube_id = str(tube.get("id", f"tube_{sel}"))
+    tube = tubes[selected_index]
+    tube_id = str(tube.get("id", f"tube_{selected_index}"))
     tube_length = float(tube.get("length", 0.0))
     joints = list(tube.get("joints", []) or [])
 
@@ -249,6 +282,7 @@ def main():
 
     log_path = design_log_path(design_path, settings)
 
+    # summarise configuration and wait for user to mount first tube
     print("\n=== Ready ===")
     print(f"Tube: {tube_id}  length={tube_length}mm  joints={len(joints)}")
     print(f"Design file: {design_path}")
@@ -257,7 +291,8 @@ def main():
     input("\nMount tube, then press Enter to START (will zero motor here)...")
 
     # --- FSM start ---
-    tube_t0 = time.perf_counter()
+    # record start time for full-tube duration
+    tube_start_time = time.perf_counter()
 
     # tube mounted → motor.zero_here()
     motor.zero_here()
@@ -279,31 +314,32 @@ def main():
     )
 
     # For each joint
-    for joint_seq, j in enumerate(joints):
-        joint_id = str(j.get("id", f"joint_{joint_seq}"))
-        joint_type = str(j.get("type", "")).strip()
-        ori = str(j.get("ori", "")).strip()
-        position_mm = float(j.get("position_mm", 0.0))
-        rotation_deg = float(j.get("rotation_deg", 0.0))
+    for joint_index, joint_entry in enumerate(joints):
+        joint_id = str(joint_entry.get("id", f"joint_{joint_index}"))
+        joint_type = str(joint_entry.get("type", "")).strip()
+        joint_orientation = str(joint_entry.get("ori", "")).strip()
+        position_mm = float(joint_entry.get("position_mm", 0.0))
+        rotation_deg = float(joint_entry.get("rotation_deg", 0.0))
 
         # Compute target position (design truth + offsets)
-        joint_offset = offset_map[(joint_type, ori)]
+        joint_offset = offset_map[(joint_type, joint_orientation)]
         target_mm = position_mm + sensor_global_offset_mm + joint_offset
 
         print("\n" + "-" * 60)
         print(
-            f"Joint {joint_seq+1}/{len(joints)} | id={joint_id} | type={joint_type} ori={ori}"
+            f"Joint {joint_index+1}/{len(joints)} | id={joint_id} | type={joint_type} ori={joint_orientation}"
         )
         print(
             f"Target: position_mm={position_mm:.1f}mm  -> target_mm={target_mm:.1f}mm (global+joint offsets applied)"
         )
         print(f"Target rotation: rotation_deg={rotation_deg:.1f}°")
 
-        # POSITIONING_J1_LINEAR
-        linear_t0 = time.perf_counter()
+        # POSITIONING_J1_LINEAR (start timing the linear adjustment)
+        linear_start_time = time.perf_counter()
 
-        last_raw_mm: Optional[int] = None
-        last_measured_mm: Optional[float] = None
+        # remember the last few values for potential debugging/logging
+        last_raw_sensor_mm: Optional[int] = None
+        last_measured_sensor_mm: Optional[float] = None
         last_error_mm: Optional[float] = None
 
         print(
@@ -312,19 +348,20 @@ def main():
         print("Live: current_mm_raw | measured_mm | target_mm | error_mm")
 
         while True:
-            raw_mm = int(sensor.read_mm())
-            measured_mm = (
-                float(raw_mm) + sensor_global_offset_mm
+            # read current position from the distance sensor
+            raw_sensor_mm = int(sensor.read_mm())
+            measured_sensor_mm = (
+                float(raw_sensor_mm) + sensor_global_offset_mm
             )  # measured = raw + global offset only
-            error_mm = measured_mm - target_mm
+            error_mm = measured_sensor_mm - target_mm
 
-            last_raw_mm = raw_mm
-            last_measured_mm = measured_mm
+            last_raw_sensor_mm = raw_sensor_mm
+            last_measured_sensor_mm = measured_sensor_mm
             last_error_mm = error_mm
 
             # Print on one line
             line = (
-                f"\r  raw={raw_mm:6d} mm | meas={measured_mm:8.2f} | "
+                f"\r  raw={raw_sensor_mm:6d} mm | meas={measured_sensor_mm:8.2f} | "
                 f"target={target_mm:8.2f} | err={error_mm:7.2f}   "
                 f"(tol ±{linear_tol_mm})"
             )
@@ -333,7 +370,9 @@ def main():
             if enter_pressed_nonblocking():
                 # attempt confirm
                 if abs(error_mm) <= linear_tol_mm:
-                    linear_time_ms = int((time.perf_counter() - linear_t0) * 1000)
+                    linear_time_ms = int(
+                        (time.perf_counter() - linear_start_time) * 1000
+                    )
                     print("\n[ok] Linear position confirmed.")
                     append_event(
                         log_path,
@@ -344,11 +383,11 @@ def main():
                             "tube_id": tube_id,
                             "joint_id": joint_id,
                             "joint_type": joint_type,
-                            "ori": ori,
-                            "joint_seq": joint_seq,
+                            "ori": joint_orientation,
+                            "joint_seq": joint_index,
                             "target_mm": target_mm,
-                            "measured_mm_raw": raw_mm,
-                            "measured_mm": measured_mm,
+                            "measured_mm_raw": raw_sensor_mm,
+                            "measured_mm": measured_sensor_mm,
                             "error_mm": error_mm,
                             "tol_mm": linear_tol_mm,
                             "linear_time_ms": linear_time_ms,
@@ -362,18 +401,18 @@ def main():
 
             time.sleep(0.1)
 
-        # ROTATING_J2
-        rot_t0 = time.perf_counter()
+        # ROTATING_J2: command motor to move and wait until it reports arrival
+        rotation_start_time = time.perf_counter()
         motor.move_absolute_deg_output(
             rotation_deg, speed_rpm=200, acc=50
         )  # speed/acc can be moved to settings later
 
         ok = motor.wait_until_reached(timeout_s=20.0)
-        rot_time_ms = int((time.perf_counter() - rot_t0) * 1000)
-        actual_deg = motor.read_realtime_position_deg_output()
+        rotation_time_ms = int((time.perf_counter() - rotation_start_time) * 1000)
+        actual_rotation_deg = motor.read_realtime_position_deg_output()
 
         print(
-            f"[rot] reached={ok} target={rotation_deg:.2f}° actual={actual_deg:.2f}° time={rot_time_ms}ms"
+            f"[rot] reached={ok} target={rotation_deg:.2f}° actual={actual_rotation_deg:.2f}° time={rotation_time_ms}ms"
         )
 
         append_event(
@@ -385,25 +424,26 @@ def main():
                 "tube_id": tube_id,
                 "joint_id": joint_id,
                 "joint_type": joint_type,
-                "ori": ori,
-                "joint_seq": joint_seq,
+                "ori": joint_orientation,
+                "joint_seq": joint_index,
                 "target_deg": rotation_deg,
-                "actual_deg": actual_deg,
+                "actual_deg": actual_rotation_deg,
                 "tol_deg": rot_tol_deg,
                 "rot_speed_rpm": rot_speed_rpm,
                 "rot_acc_rpm_s": rot_acc_rpm_s,
-                "rotation_time_ms": rot_time_ms,
+                "rotation_time_ms": rotation_time_ms,
                 "motor_reached_flag": bool(ok),
             },
         )
 
         # INSTALLING
+        # INSTALLING: human operator steps in
         print(
-            f"\nInstall joint now: type={joint_type} ori={ori}. Press ENTER when installed."
+            f"\nInstall joint now: type={joint_type} ori={joint_orientation}. Press ENTER when installed."
         )
-        install_t0 = time.perf_counter()
+        install_start_time = time.perf_counter()
         input()
-        install_time_ms = int((time.perf_counter() - install_t0) * 1000)
+        install_time_ms = int((time.perf_counter() - install_start_time) * 1000)
 
         append_event(
             log_path,
@@ -414,14 +454,14 @@ def main():
                 "tube_id": tube_id,
                 "joint_id": joint_id,
                 "joint_type": joint_type,
-                "ori": ori,
-                "joint_seq": joint_seq,
+                "ori": joint_orientation,
+                "joint_seq": joint_index,
                 "install_time_ms": install_time_ms,
             },
         )
 
     # DONE
-    tube_time_ms = int((time.perf_counter() - tube_t0) * 1000)
+    total_tube_time_ms = int((time.perf_counter() - tube_start_time) * 1000)
     append_event(
         log_path,
         {
@@ -433,13 +473,13 @@ def main():
             "joint_type": None,
             "ori": None,
             "joint_seq": None,
-            "tube_time_ms": tube_time_ms,
+            "tube_time_ms": total_tube_time_ms,
             "completed": True,
         },
     )
 
     print("\n" + "=" * 60)
-    print(f"Tube complete: {tube_id} | total time = {tube_time_ms/1000:.1f}s")
+    print(f"Tube complete: {tube_id} | total time = {total_tube_time_ms/1000:.1f}s")
     print(f"Log written to: {log_path}")
 
     client.close()
