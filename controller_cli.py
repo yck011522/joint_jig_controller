@@ -421,6 +421,16 @@ def main():
                 f"Hardware probe failed (sensor or motor not responding): {e!r}"
             )
 
+    # --- 3b) Reset motor: clear any leftover stall/protection, disable, re-enable ---
+    print("[init] Resetting motor state ...")
+    motor.clear_stall_protection()
+    time.sleep(0.3)
+    motor.set_enabled(False)
+    time.sleep(0.3)
+    motor.set_enabled(True)
+    time.sleep(0.3)
+    print(f"[init] Motor reset complete. Enabled: {motor.is_enabled()}")
+
     # --- 4) Load design JSON (hardcoded) ---
     design_path = base_dir / "design" / "dummy.json"
     if not design_path.exists():
@@ -607,9 +617,28 @@ def main():
 
                 stall_occurred = False
                 while True:
-                    motor.move_absolute_deg_output(
-                        rotation_deg, speed_rpm=rot_speed_rpm, acc=rot_acc
-                    )
+                    # Record start time for this attempt
+                    motion_attempt_start = time.perf_counter()
+
+                    # Send motion command (retry if motor rejects it
+                    # after stall recovery)
+                    for attempt in range(3):
+                        try:
+                            motor.move_absolute_deg_output(
+                                rotation_deg,
+                                speed_rpm=rot_speed_rpm,
+                                acc=rot_acc,
+                            )
+                            break
+                        except Exception as e:
+                            if attempt < 2:
+                                print(
+                                    f"\n[retry] Motor rejected command "
+                                    f"(attempt {attempt+1}/3): {e}"
+                                )
+                                time.sleep(0.5)
+                            else:
+                                raise
 
                     # Poll until reached or stall
                     ok = False
@@ -631,9 +660,16 @@ def main():
                         break
 
                     # Handle stall: log, prompt operator, recover, retry
+                    stall_time_elapsed_ms = int(
+                        (time.perf_counter() - motion_attempt_start) * 1000
+                    )
+                    stall_position_deg = motor.read_realtime_position_deg_output()
                     print(
-                        "\n[STALL] Motor stall detected! The rotation axis "
-                        "may be blocked."
+                        f"\n[STALL] Motor stall detected! The rotation axis "
+                        f"may be blocked."
+                        f"\n        Position at stall: {stall_position_deg:.2f}° "
+                        f"(target: {rotation_deg:.2f}°)  "
+                        f"time since motion start: {stall_time_elapsed_ms} ms"
                     )
                     append_event(
                         log_path,
@@ -647,18 +683,40 @@ def main():
                             "ori": joint_orientation,
                             "joint_seq": joint_index,
                             "target_deg": rotation_deg,
+                            "actual_deg": stall_position_deg,
+                            "time_since_motion_start_ms": stall_time_elapsed_ms,
                         },
                     )
                     motor.clear_stall_protection()
-                    time.sleep(0.1)
+                    time.sleep(0.3)
                     motor.set_enabled(True)
-                    time.sleep(0.1)
+                    time.sleep(0.5)
+
+                    # Verify motor is ready before prompting
+                    flags = motor.read_status_flags()
+                    if not (flags & motor.FLAG_ENABLED):
+                        print("[STALL] Warning: motor did not re-enable. "
+                              "Trying again...")
+                        motor.clear_stall_protection()
+                        time.sleep(0.3)
+                        motor.set_enabled(True)
+                        time.sleep(0.5)
 
                     input(
                         "[STALL] Clear the obstruction, then press ENTER "
                         "to retry the rotation... "
                     )
                     stall_occurred = False  # reset for retry
+
+                    # Re-arm stall detection for the retry
+                    if stall_enabled:
+                        motor.write_stall_params(
+                            mode=0x01,
+                            speed_rpm=stall_speed_rpm,
+                            current_ma=stall_current_ma,
+                            time_ms=stall_time_ms,
+                            store=False,
+                        )
 
                 # Disable stall detection (restore high current for holding)
                 if stall_enabled:
