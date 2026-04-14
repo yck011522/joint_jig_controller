@@ -3,7 +3,7 @@
     "serial": {
         "baudrate": 115200,
         "timeout_s": 0.2,
-        "port" : "COM3"
+        "port": "COM3"
     },
     "device_addresses": {
         "motor_addr": 2,
@@ -84,5 +84,6 @@
         "enabled": true,
         "log_extension": ".log.jsonl",
         "flush_each_event": true
-    }
+    },
+    "last_design_dir": "C:\\Users\\Victor\\Documents\\GitHub\\joint_jig_controller\\design"
 }

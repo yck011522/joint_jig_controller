@@ -3,7 +3,7 @@ jig_controller.py — Shared controller logic for the joint placement jig.
 
 This module contains all hardware-interfacing, configuration parsing, and
 assembly-workflow logic that is independent of the user interface.  Both the
-CLI (controller_cli.py) and a future GUI can import from here.
+CLI (controller_cli.py) and the GUI (controller_gui.py) import from here.
 
 Key responsibilities:
   - Parse settings.json into typed dataclasses.
@@ -13,13 +13,16 @@ Key responsibilities:
   - Provide a rotate-with-stall-detection routine that handles retries.
   - Logging helpers (JSONL event append, ISO timestamp).
   - Design file validation (schema, offset completeness).
+  - Log parsing: read past events to determine tube completion status.
 """
 
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -28,6 +31,19 @@ import serial.tools.list_ports
 
 from distance_sensor import DistanceSensor
 from motor_comm import MotorCommError, ZDTEmmMotor, MotorKinematics
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Event name constants — used in both log writing and parsing
+# ═══════════════════════════════════════════════════════════════
+
+EVENT_TUBE_START = "tube_start"
+EVENT_LINEAR_CONFIRM = "linear_confirm"
+EVENT_ROTATION_REACHED = "rotation_reached"
+EVENT_STALL_DETECTED = "stall_detected"
+EVENT_INSTALL_CONFIRM = "install_confirm"
+EVENT_TUBE_INSTALL_COMPLETE = "tube_install_complete"
+EVENT_TUBE_ABANDONED = "tube_abandoned"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -68,9 +84,146 @@ def append_event(log_path: Path, event_obj: dict) -> None:
 
 
 def design_log_path(design_path: Path, settings: dict) -> Path:
-    """Derive the log file path from the design JSON path and settings."""
+    """Derive the log file path from the design JSON path and settings.
+
+    The log file always lives next to the design JSON file.
+    """
     ext = safe_get(settings, ["logging", "log_extension"], default=".log.jsonl")
     return design_path.with_name(design_path.stem + ext)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Log parsing — read past events from a JSONL log file
+# ═══════════════════════════════════════════════════════════════
+
+def parse_log_events(log_path: Path) -> List[dict]:
+    """Read all events from an existing JSONL log file.
+
+    Returns an empty list if the file doesn't exist.  Malformed lines
+    (non-JSON) are silently skipped.
+    """
+    if not log_path.exists():
+        return []
+    events: List[dict] = []
+    with log_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue  # skip corrupted lines
+    return events
+
+
+@dataclass
+class TubeCompletionInfo:
+    """Summary of the most recent successful assembly of one tube."""
+    tube_id: str
+    completed_at: str          # ISO timestamp string
+    tube_time_ms: int          # total assembly time in ms
+
+
+def get_tube_completion_map(
+    events: List[dict],
+) -> Dict[str, TubeCompletionInfo]:
+    """Scan log events and return the *last* completion record per tube_id.
+
+    Looks for both the old ``"tube_complete"`` event name and the new
+    ``"tube_install_complete"`` name so that existing logs still work.
+    """
+    completion_map: Dict[str, TubeCompletionInfo] = {}
+    for ev in events:
+        event_type = ev.get("event", "")
+        # Accept both old and new event names
+        if event_type not in (EVENT_TUBE_INSTALL_COMPLETE, "tube_complete"):
+            continue
+        tube_id = ev.get("tube_id", "")
+        if not tube_id:
+            continue
+        completion_map[tube_id] = TubeCompletionInfo(
+            tube_id=tube_id,
+            completed_at=ev.get("ts", ""),
+            tube_time_ms=int(ev.get("tube_time_ms", 0)),
+        )
+    return completion_map
+
+
+def format_time_ago(iso_ts: str) -> str:
+    """Format an ISO-8601 local timestamp as a human-friendly relative string.
+
+    Examples:
+      - "30s ago"
+      - "5 min ago"
+      - "2 hours ago"
+      - "2026-04-14 16:19"  (if older than today)
+    """
+    try:
+        # Parse the ISO timestamp (with optional milliseconds)
+        fmt = "%Y-%m-%dT%H:%M:%S"
+        ts_str = iso_ts[:19]  # trim milliseconds if present
+        dt = datetime.strptime(ts_str, fmt)
+    except (ValueError, IndexError):
+        return iso_ts  # can't parse — return raw
+
+    now = datetime.now()
+    delta = now - dt
+
+    total_seconds = int(delta.total_seconds())
+    if total_seconds < 0:
+        return iso_ts  # future timestamp — just show raw
+
+    # If it's from a different calendar day, show full date
+    if dt.date() != now.date():
+        return dt.strftime("%Y-%m-%d %H:%M")
+
+    # Same day — show relative
+    if total_seconds < 60:
+        return f"{total_seconds}s ago"
+    minutes = total_seconds // 60
+    if minutes < 60:
+        return f"{minutes} min ago"
+    hours = minutes // 60
+    return f"{hours} hours ago"
+
+
+def format_duration_ms(ms: int) -> str:
+    """Format a duration in milliseconds as a concise human string.
+
+    Examples: "45s", "2m 18s", "1h 5m"
+    """
+    seconds = ms // 1000
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    secs = seconds % 60
+    if minutes < 60:
+        return f"{minutes}m {secs}s"
+    hours = minutes // 60
+    mins = minutes % 60
+    return f"{hours}h {mins}m"
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Settings persistence helpers
+# ═══════════════════════════════════════════════════════════════
+
+def save_settings(settings_path: Path, settings: dict) -> None:
+    """Write settings dict back to disk (pretty-printed JSON)."""
+    with settings_path.open("w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=4, ensure_ascii=False)
+        f.write("\n")
+
+
+def get_last_design_dir(settings: dict) -> Optional[str]:
+    """Return the last used design file directory, or None."""
+    return safe_get(settings, ["last_design_dir"])
+
+
+def set_last_design_dir(settings: dict, dir_path: str) -> None:
+    """Update the in-memory settings with the last used design directory."""
+    settings["last_design_dir"] = dir_path
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -257,6 +410,266 @@ class HardwareContext:
     def close(self) -> None:
         """Close the underlying Modbus client cleanly."""
         self.client.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+#  HardwareHub — centralised, thread-safe hardware interface
+# ═══════════════════════════════════════════════════════════════
+
+class HardwareHub:
+    """Thread-safe hardware abstraction layer.
+
+    A single daemon thread polls sensor + motor readings at a fixed
+    interval and caches them.  Any thread may read cached values without
+    blocking.  All *command* methods (move, zero, arm/disarm stall, etc.)
+    acquire an internal lock so only one Modbus transaction is on the bus
+    at a time.
+
+    Usage::
+
+        hub = HardwareHub(hw, poll_interval_s=0.5)
+        # Read latest cached values (thread-safe, non-blocking)
+        print(hub.sensor_mm, hub.motor_deg, hub.flags)
+        # Send a motor command (acquires lock)
+        hub.zero_here()
+        hub.stop()          # stop the poller
+    """
+
+    def __init__(self, hw: HardwareContext, poll_interval_s: float = 0.5):
+        self._hw = hw
+        self._lock = threading.Lock()
+        self._poll_interval = poll_interval_s
+        self._stop_event = threading.Event()
+
+        # Cached readings — written only by the poller thread.
+        # Reading a Python float/int attribute is atomic on CPython
+        # (GIL), so callers may read without taking the lock.
+        self.sensor_mm: Optional[int] = None
+        self.motor_deg: Optional[float] = None
+        self.flags: int = 0
+        self.enabled: bool = False
+        self.reached: bool = False
+        self.stall_detected: bool = False
+        self.stall_protected: bool = False
+        self.poll_error: Optional[str] = None
+        self.port: str = hw.port
+
+        self._thread = threading.Thread(
+            target=self._poll_loop, daemon=True, name="hw-hub-poller",
+        )
+        self._thread.start()
+
+    # ── Background poller ────────────────────────────────────────
+
+    def _poll_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                with self._lock:
+                    self.sensor_mm = self._hw.sensor.read_mm()
+                    self.motor_deg = self._hw.motor.read_realtime_position_deg_output()
+                    flags = self._hw.motor.read_status_flags()
+                self.flags = flags
+                self.enabled = bool(flags & self._hw.motor.FLAG_ENABLED)
+                self.reached = bool(flags & self._hw.motor.FLAG_REACHED)
+                self.stall_detected = bool(flags & self._hw.motor.FLAG_STALL_DETECTED)
+                self.stall_protected = bool(flags & self._hw.motor.FLAG_STALL_PROTECTED)
+                self.poll_error = None
+            except Exception as e:
+                self.poll_error = str(e)
+            self._stop_event.wait(self._poll_interval)
+
+    def set_poll_interval(self, interval_s: float) -> None:
+        """Change how often the poller reads the bus."""
+        self._poll_interval = interval_s
+
+    # ── Synchronous read helpers (acquire lock, read, release) ───
+
+    def read_sensor_mm_sync(self) -> int:
+        """Read sensor distance right now (blocking)."""
+        with self._lock:
+            return self._hw.sensor.read_mm()
+
+    def read_motor_deg_sync(self) -> float:
+        """Read motor position right now (blocking)."""
+        with self._lock:
+            return self._hw.motor.read_realtime_position_deg_output()
+
+    def read_flags_sync(self) -> int:
+        """Read motor status flags right now (blocking)."""
+        with self._lock:
+            return self._hw.motor.read_status_flags()
+
+    # ── Motor commands ───────────────────────────────────────────
+
+    def zero_here(self) -> None:
+        """Set the current motor position as zero."""
+        with self._lock:
+            self._hw.motor.zero_here()
+
+    def arm_stall(self, stall: StallSettings) -> None:
+        """Write sensitive stall-detection thresholds."""
+        with self._lock:
+            arm_stall_detection(self._hw.motor, stall)
+
+    def disarm_stall(self, stall: StallSettings) -> None:
+        """Restore safe holding-current stall thresholds."""
+        with self._lock:
+            disarm_stall_detection(self._hw.motor, stall)
+
+    def recover_from_stall(self) -> None:
+        """Clear stall protection and re-enable the motor.
+
+        Must be called while the poller is still running — each sub-step
+        acquires/releases the lock individually so the poller can
+        interleave between the recovery delays.
+        """
+        with self._lock:
+            self._hw.motor.clear_stall_protection()
+        time.sleep(0.3)
+        with self._lock:
+            self._hw.motor.set_enabled(True)
+        time.sleep(0.5)
+        # Verify
+        flags = self.read_flags_sync()
+        if not (flags & self._hw.motor.FLAG_ENABLED):
+            with self._lock:
+                self._hw.motor.clear_stall_protection()
+            time.sleep(0.3)
+            with self._lock:
+                self._hw.motor.set_enabled(True)
+            time.sleep(0.5)
+
+    def send_move_absolute(
+        self, target_deg: float, speed_rpm: int, acc: int,
+        max_attempts: int = 3,
+    ) -> None:
+        """Send an absolute-position command with retry on transient errors."""
+        for attempt in range(max_attempts):
+            try:
+                with self._lock:
+                    self._hw.motor.move_absolute_deg_output(
+                        target_deg, speed_rpm=speed_rpm, acc=acc,
+                    )
+                return
+            except Exception:
+                if attempt < max_attempts - 1:
+                    time.sleep(0.5)
+                else:
+                    raise
+
+    # ── High-level rotation with stall detection + progress ──────
+
+    def rotate_with_stall_detection(
+        self,
+        target_deg: float,
+        motion: MotionSettings,
+        stall: StallSettings,
+        *,
+        on_progress: Optional[Callable[[float, float], None]] = None,
+        on_stall: Optional[Callable[[float, float, int], None]] = None,
+        abort: Optional[threading.Event] = None,
+        timeout_s: float = 20.0,
+    ) -> RotationResult:
+        """Rotate with stall detection, fine-grained locking, and progress.
+
+        Unlike the module-level ``rotate_with_stall_detection`` function
+        (which holds the lock for the entire duration), this method
+        acquires the lock only for each individual Modbus transaction,
+        allowing the background poller to keep updating cached readings.
+
+        Args:
+            target_deg: Absolute output-shaft angle in degrees.
+            motion:     Motion settings (speed, acc).
+            stall:      Stall detection settings.
+            on_progress: ``(actual_deg, target_deg)`` called every poll
+                         cycle so the GUI can update a progress bar.
+            on_stall:   ``(actual_deg, target_deg, elapsed_ms)`` called on
+                        stall; should block until operator is ready to retry.
+            abort:      If set, the rotation is abandoned early.
+            timeout_s:  Per-attempt timeout.
+
+        Returns:
+            A ``RotationResult``.
+        """
+        rotation_start = time.perf_counter()
+        stall_events: list[dict] = []
+        poll_s = self._hw.motor.poll_period_s
+
+        self.arm_stall(stall)
+
+        reached = False
+        while True:
+            if abort and abort.is_set():
+                break
+
+            attempt_start = time.perf_counter()
+            self.send_move_absolute(
+                target_deg, motion.rot_speed_rpm, motion.rot_acc,
+            )
+
+            # Poll flags until reached or stall (fine-grained locking)
+            stall_occurred = False
+            t0 = time.time()
+            while True:
+                if abort and abort.is_set():
+                    break
+                flags = self.read_flags_sync()
+                actual = self.motor_deg  # use cached value for progress
+                if on_progress and actual is not None:
+                    on_progress(actual, target_deg)
+                if flags & self._hw.motor.FLAG_STALL_PROTECTED:
+                    stall_occurred = True
+                    break
+                if flags & self._hw.motor.FLAG_REACHED:
+                    reached = True
+                    break
+                if (time.time() - t0) >= timeout_s:
+                    break
+                time.sleep(poll_s)
+
+            if abort and abort.is_set():
+                break
+            if not stall_occurred:
+                break
+
+            # Stall detected
+            elapsed_ms = int((time.perf_counter() - attempt_start) * 1000)
+            actual_deg = self.read_motor_deg_sync()
+            stall_events.append({
+                "ts": now_iso_local(),
+                "target_deg": target_deg,
+                "actual_deg": actual_deg,
+                "time_since_motion_start_ms": elapsed_ms,
+            })
+            self.recover_from_stall()
+            if on_stall is not None:
+                on_stall(actual_deg, target_deg, elapsed_ms)
+            if abort and abort.is_set():
+                break
+            self.arm_stall(stall)
+
+        self.disarm_stall(stall)
+        total_ms = int((time.perf_counter() - rotation_start) * 1000)
+        actual_deg = self.read_motor_deg_sync()
+
+        return RotationResult(
+            reached=reached,
+            target_deg=target_deg,
+            actual_deg=actual_deg,
+            rotation_time_ms=total_ms,
+            stall_events=stall_events,
+        )
+
+    # ── Lifecycle ────────────────────────────────────────────────
+
+    def stop(self) -> None:
+        """Stop the background poller thread."""
+        self._stop_event.set()
+
+    def close(self) -> None:
+        """Stop the poller and close the underlying Modbus client."""
+        self.stop()
+        self._hw.close()
 
 
 def _list_available_ports() -> list:
