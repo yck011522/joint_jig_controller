@@ -166,32 +166,59 @@ Example:
 
 ------
 
-### 5) `tube_complete`
+### 5) `stall_detected`
 
-Written when last joint installed.
+Written when the motor stall protection triggers during rotation.
+
+Fields:
+
+- common fields +:
+- `target_deg`
+- `actual_deg`
+- `time_since_motion_start_ms`
+
+------
+
+### 6) `tube_install_complete`
+
+Written when the last joint is installed successfully.
+
+> **Note:** The code also accepts the legacy event name `tube_complete` when
+> reading existing logs, but new events are always written as
+> `tube_install_complete`.
 
 Fields:
 
 - common fields +:
 - `tube_time_ms`
-- `completed` (bool) — true for normal finish (useful later if you add abort)
 
 Example:
 
 ```
 {
   "ts": "2026-03-03T21:34:55.010",
-  "event": "tube_complete",
+  "event": "tube_install_complete",
   "design_file": "MyDesign.json",
   "tube_id": "TUBE_001",
   "joint_id": null,
   "joint_type": null,
   "ori": null,
   "joint_seq": null,
-  "tube_time_ms": 1180000,
-  "completed": true
+  "tube_time_ms": 1180000
 }
 ```
+
+------
+
+### 7) `tube_abandoned`
+
+Written when the operator abandons a tube mid-assembly.
+
+Fields:
+
+- common fields +:
+- `tube_time_ms`
+- `completed_joints` — number of joints finished before abandoning
 
 ------
 
@@ -200,7 +227,7 @@ Example:
 When loading a design:
 
 - read the log file line-by-line
-- for each `tube_id`, look for the **latest** `tube_complete` with `completed=true`
+- for each `tube_id`, look for the **latest** `tube_install_complete` (or legacy `tube_complete`)
 - status column = “Done (timestamp)” or “Not done”
 
 This stays stable even if you later add more event types.

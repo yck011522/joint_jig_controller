@@ -242,29 +242,33 @@ JSON acts as interface between design and production.
 
 ---
 
-# 5. JSON Structure (Conceptual)
+# 5. JSON Design Schema
+
+Design files follow schema v1 (see [json_schema.md](json_schema.md) for full spec).
 
 ```json
 {
-  "project_name": "SmallTower",
+  "schema_version": 1,
+  "project_id": "Batch_2026_04",
   "tubes": [
     {
-      "tube_id": "T01",
-      "length_mm": 2400,
+      "id": "T1",
+      "length": 1000,
       "joints": [
         {
-          "index": 0,
-          "type": "T20-M",
-          "position_mm": 120,
-          "rotation_deg": 45,
-          "orientation": "A"
+          "id": "J001",
+          "type": "T20-5-M",
+          "ori": "L",
+          "position_mm": 120.0,
+          "rotation_deg": 45.0
         }
       ]
     }
   ]
 }
-
 ```
+
+Joints are sorted by `position_mm` at runtime — file order does not matter.
 # 6. Configuration File
 
 Control Software settings file (settings.json) defines:
@@ -303,27 +307,39 @@ Logged per joint:
 - Linear positioning time
 - Joint fastening time
 
-# 8. Statistics & Analytics Module
+# 8. Software Components
 
-Software provides analysis of:
+| File | Purpose |
+|------|---------|
+| `controller_gui.py` | Tkinter GUI — operator wizard + engineer debug panel |
+| `controller_cli.py` | Terminal-based CLI for headless operation |
+| `jig_controller.py` | Shared module — settings, hardware, workflow logic, logging |
+| `motor_comm.py` | ZDT Emm motor driver (Modbus RTU) |
+| `distance_sensor.py` | JK-LRD distance sensor driver (Modbus RTU) |
+| `settings.json` | Runtime configuration (serial, motion, stall, offsets) |
+| `requirements.txt` | Python dependencies |
 
-- Tube-Level Metrics
-- Total production time
-- Joint count
-- Joint type distribution
-- Operator Metrics
-  - Average time per joint
-  - Average time per tube
-  - Efficiency trend over time
+### GUI features
 
-Predictive use to estimate build time based on:
-- Tube length
-- Joint count
-- Joint type distribution
+- Split-panel layout: operator assembly wizard (left) + engineer panel (right)
+- Joint reference images displayed during each installation step
+- Rotation progress bar during motor movement
+- Tube completion status table with time-ago display
+- Stall detection with retry prompt
+- Automatic reconnect button when the USB adapter is unplugged
 
-Identify bottlenecks
+### CLI features
 
-Analyze learning curve
+- Interactive terminal workflow with live sensor readout
+- Design file selection with tube completion status
+- Abandon tube support
+
+### Reconnect behaviour
+
+If the RS-485 USB adapter is disconnected mid-session, the system detects
+the failure (3 consecutive poll errors) and shows a **Reconnect** button in
+the engineer panel (GUI) or an error message (CLI). Re-plugging the adapter
+and pressing Reconnect re-establishes the connection without restarting.
 
 # 9. System Philosophy
 
@@ -339,14 +355,11 @@ Data logging transforms manual fabrication into measurable production.
 
 # 10. Future Extensions
 
-Automatic label printer
-
-Multi-operator analytics
-
-Time prediction model
-
-Real-time graphical tolerance visualization
-
-Cloud-based dashboard
+- Automatic label printer
+- Statistics & analytics module (per-tube metrics, operator trends, build-time prediction)
+- Multi-operator analytics
+- Time prediction model
+- Real-time graphical tolerance visualization
+- Cloud-based dashboard
 
 QR-code tube tracking

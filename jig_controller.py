@@ -489,10 +489,6 @@ class HardwareHub:
                     self.connected = False
             self._stop_event.wait(self._poll_interval)
 
-    def set_poll_interval(self, interval_s: float) -> None:
-        """Change how often the poller reads the bus."""
-        self._poll_interval = interval_s
-
     # ── Synchronous read helpers (acquire lock, read, release) ───
 
     def read_sensor_mm_sync(self) -> int:
