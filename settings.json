@@ -22,6 +22,13 @@
         "rot_acc": 100,
         "rot_tol_deg": 1.0
     },
+    "stall": {
+        "enabled": true,
+        "speed_rpm": 100,
+        "current_ma": 400,
+        "time_ms": 50,
+        "disabled_current_ma": 2000
+    },
     "linear": {
         "linear_tol_mm": 2.0,
         "sensor_global_offset_mm": 0.0,

@@ -142,6 +142,29 @@ def enter_pressed_nonblocking() -> bool:
     return False
 
 
+def prompt_choice(prompt_text: str, valid_range: range, *, allow_quit: bool = True) -> Optional[int]:
+    """Prompt the user for an integer within *valid_range*.
+
+    Returns the chosen integer, or None if the user types 'q'/'quit' (when
+    *allow_quit* is True).  Loops until a valid input is given — never raises.
+    """
+    while True:
+        raw = input(prompt_text).strip().lower()
+        if allow_quit and raw in ("q", "quit", "exit"):
+            return None
+        try:
+            value = int(raw)
+        except ValueError:
+            print(f"  [!] Please enter a number ({valid_range.start}–{valid_range.stop - 1})"
+                  + (" or 'q' to quit." if allow_quit else "."))
+            continue
+        if value not in valid_range:
+            print(f"  [!] Out of range. Choose {valid_range.start}–{valid_range.stop - 1}"
+                  + (" or 'q' to quit." if allow_quit else "."))
+            continue
+        return value
+
+
 # ----------------------------
 # COM port auto-detection
 # ----------------------------
@@ -412,251 +435,335 @@ def main():
         client.close()
         raise RuntimeError("Design file contains no tubes[].")
 
-    # --- 5) Choose tube in CLI ---
-    # show available tubes from the design so operator can choose one
-    print("\n=== Tube List ===")
-    for idx, tube_entry in enumerate(tubes):
-        display_id = tube_entry.get("id", f"tube_{idx}")
-        length = tube_entry.get("length", "?")
-        num_joints = len(tube_entry.get("joints", []) or [])
-        print(f"  [{idx}] id={display_id}  length={length}mm  joints={num_joints}")
-
-    sel_str = input("Select tube index and press Enter: ").strip()
-    if sel_str == "":
-        selected_index = 0
-    else:
-        selected_index = int(sel_str)
-
-    if selected_index < 0 or selected_index >= len(tubes):
-        client.close()
-        raise RuntimeError(f"Invalid tube selection: {selected_index}")
-
-    tube = tubes[selected_index]
-    tube_id = str(tube.get("id", f"tube_{selected_index}"))
-    tube_length = float(tube.get("length", 0.0))
-    joints = list(tube.get("joints", []) or [])
-
-    # Sort joints by position_mm (left->right)
-    joints.sort(key=lambda j: float(j.get("position_mm", 0.0)))
-
-    # --- Offset completeness enforcement (before starting assembly) ---
+    # --- Pre-compute shared settings used by every tube ---
     offset_map = build_offset_map(settings)
-    validate_offsets_complete(tube, offset_map)
-
-    # Extract other settings
     linear_tol_mm = float(safe_get(settings, ["linear", "linear_tol_mm"], default=2.0))
     sensor_global_offset_mm = float(
         safe_get(settings, ["linear", "sensor_global_offset_mm"], default=0.0)
     )
-
     rot_speed_rpm = int(safe_get(settings, ["motion", "rot_speed_rpm"], default=300))
     rot_acc = int(safe_get(settings, ["motion", "rot_acc"], default=100))
     rot_tol_deg = float(safe_get(settings, ["motion", "rot_tol_deg"], default=1.0))
-
     log_path = design_log_path(design_path, settings)
 
-    # summarise configuration and wait for user to mount first tube
-    print("\n=== Ready ===")
-    print(f"Tube: {tube_id}  length={tube_length}mm  joints={len(joints)}")
-    print(f"Design file: {design_path}")
-    print(f"Log file:    {log_path}")
-    print(f"Tolerance:   linear ±{linear_tol_mm} mm | rotation ±{rot_tol_deg} deg")
-    input("\nMount tube, then press Enter to START (will zero motor here)...")
+    # Stall detection settings
+    stall_enabled = bool(safe_get(settings, ["stall", "enabled"], default=True))
+    stall_speed_rpm = int(safe_get(settings, ["stall", "speed_rpm"], default=100))
+    stall_current_ma = int(safe_get(settings, ["stall", "current_ma"], default=400))
+    stall_time_ms = int(safe_get(settings, ["stall", "time_ms"], default=50))
+    stall_disabled_current_ma = int(safe_get(settings, ["stall", "disabled_current_ma"], default=2000))
 
-    # --- FSM start ---
-    # record start time for full-tube duration
-    tube_start_time = time.perf_counter()
+    # --- 5) Multi-tube workflow loop ---
+    tubes_completed = 0
 
-    # tube mounted → motor.zero_here()
-    motor.zero_here()
-
-    append_event(
-        log_path,
-        {
-            "ts": now_iso_local(),
-            "event": "tube_start",
-            "design_file": design_path.name,
-            "tube_id": tube_id,
-            "joint_id": None,
-            "joint_type": None,
-            "ori": None,
-            "joint_seq": None,
-            "tube_length_mm": tube_length,
-            "num_joints": len(joints),
-        },
-    )
-
-    # For each joint
-    for joint_index, joint_entry in enumerate(joints):
-        joint_id = str(joint_entry.get("id", f"joint_{joint_index}"))
-        joint_type = str(joint_entry.get("type", "")).strip()
-        joint_orientation = str(joint_entry.get("ori", "")).strip()
-        position_mm = float(joint_entry.get("position_mm", 0.0))
-        rotation_deg = float(joint_entry.get("rotation_deg", 0.0))
-
-        # Compute target position (design truth + offsets)
-        joint_offset = offset_map[(joint_type, joint_orientation)]
-        target_mm = position_mm + sensor_global_offset_mm + joint_offset
-
-        print("\n" + "-" * 60)
-        print(
-            f"Joint {joint_index+1}/{len(joints)} | id={joint_id} | type={joint_type} ori={joint_orientation}"
-        )
-        print(
-            f"Target: position_mm={position_mm:.1f}mm  -> target_mm={target_mm:.1f}mm (global+joint offsets applied)"
-        )
-        print(f"Target rotation: rotation_deg={rotation_deg:.1f}°")
-
-        # POSITIONING_J1_LINEAR (start timing the linear adjustment)
-        linear_start_time = time.perf_counter()
-
-        # remember the last few values for potential debugging/logging
-        last_raw_sensor_mm: Optional[int] = None
-        last_measured_sensor_mm: Optional[float] = None
-        last_error_mm: Optional[float] = None
-
-        print(
-            "\nMove carriage to target. Press ENTER to attempt confirm (non-blocking on Windows)."
-        )
-        print("Live: current_mm_raw | measured_mm | target_mm | error_mm")
-
+    try:
         while True:
-            # read current position from the distance sensor
-            raw_sensor_mm = int(sensor.read_mm())
-            measured_sensor_mm = (
-                float(raw_sensor_mm) + sensor_global_offset_mm
-            )  # measured = raw + global offset only
-            error_mm = measured_sensor_mm - target_mm
+            print("\n" + "=" * 60)
+            print("  TUBE SELECTION")
+            print("=" * 60)
+            for idx, tube_entry in enumerate(tubes):
+                display_id = tube_entry.get("id", f"tube_{idx}")
+                length = tube_entry.get("length", "?")
+                num_joints = len(tube_entry.get("joints", []) or [])
+                print(f"  [{idx}] id={display_id}  length={length}mm  joints={num_joints}")
 
-            last_raw_sensor_mm = raw_sensor_mm
-            last_measured_sensor_mm = measured_sensor_mm
-            last_error_mm = error_mm
-
-            # Print on one line
-            line = (
-                f"\r  raw={raw_sensor_mm:6d} mm | meas={measured_sensor_mm:8.2f} | "
-                f"target={target_mm:8.2f} | err={error_mm:7.2f}   "
-                f"(tol ±{linear_tol_mm})"
+            selected_index = prompt_choice(
+                "\nSelect tube index (or 'q' to quit): ",
+                range(len(tubes)),
             )
-            print(line, end="", flush=True)
+            if selected_index is None:
+                print("\n[quit] Operator chose to exit.")
+                break
 
-            if enter_pressed_nonblocking():
-                # attempt confirm
-                if abs(error_mm) <= linear_tol_mm:
-                    linear_time_ms = int(
-                        (time.perf_counter() - linear_start_time) * 1000
+            tube = tubes[selected_index]
+
+            # Validate offsets for this tube before starting
+            try:
+                validate_offsets_complete(tube, offset_map)
+            except RuntimeError as e:
+                print(f"\n[error] {e}")
+                print("Skipping this tube. Fix offsets in settings.json and try again.")
+                continue
+
+            tube_id = str(tube.get("id", f"tube_{selected_index}"))
+            tube_length = float(tube.get("length", 0.0))
+            joints = list(tube.get("joints", []) or [])
+            joints.sort(key=lambda j: float(j.get("position_mm", 0.0)))
+
+            print(f"\n--- Tube: {tube_id}  length={tube_length}mm  joints={len(joints)} ---")
+            print(f"Log file:  {log_path}")
+            print(f"Tolerance: linear ±{linear_tol_mm} mm | rotation ±{rot_tol_deg} deg")
+            print(f"Motor:     speed={rot_speed_rpm} RPM  acc={rot_acc}")
+            input("\nMount tube, then press Enter to START (will zero motor here)...")
+
+            # --- Tube assembly FSM ---
+            tube_start_time = time.perf_counter()
+            motor.zero_here()
+
+            append_event(
+                log_path,
+                {
+                    "ts": now_iso_local(),
+                    "event": "tube_start",
+                    "design_file": design_path.name,
+                    "tube_id": tube_id,
+                    "joint_id": None,
+                    "joint_type": None,
+                    "ori": None,
+                    "joint_seq": None,
+                    "tube_length_mm": tube_length,
+                    "num_joints": len(joints),
+                },
+            )
+
+            for joint_index, joint_entry in enumerate(joints):
+                joint_id = str(joint_entry.get("id", f"joint_{joint_index}"))
+                joint_type = str(joint_entry.get("type", "")).strip()
+                joint_orientation = str(joint_entry.get("ori", "")).strip()
+                position_mm = float(joint_entry.get("position_mm", 0.0))
+                rotation_deg = float(joint_entry.get("rotation_deg", 0.0))
+
+                joint_offset = offset_map[(joint_type, joint_orientation)]
+                target_mm = position_mm + sensor_global_offset_mm + joint_offset
+
+                print("\n" + "-" * 60)
+                print(
+                    f"Joint {joint_index+1}/{len(joints)} | id={joint_id} "
+                    f"| type={joint_type} ori={joint_orientation}"
+                )
+                print(
+                    f"Target: position_mm={position_mm:.1f}mm  -> "
+                    f"target_mm={target_mm:.1f}mm (global+joint offsets applied)"
+                )
+                print(f"Target rotation: rotation_deg={rotation_deg:.1f}°")
+
+                # POSITIONING_J1_LINEAR
+                linear_start_time = time.perf_counter()
+                print(
+                    "\nMove carriage to target. Press ENTER to confirm "
+                    "(non-blocking on Windows)."
+                )
+                print("Live: current_mm_raw | measured_mm | target_mm | error_mm")
+
+                while True:
+                    raw_sensor_mm = int(sensor.read_mm())
+                    measured_sensor_mm = float(raw_sensor_mm) + sensor_global_offset_mm
+                    error_mm = measured_sensor_mm - target_mm
+
+                    line = (
+                        f"\r  raw={raw_sensor_mm:6d} mm | "
+                        f"meas={measured_sensor_mm:8.2f} | "
+                        f"target={target_mm:8.2f} | err={error_mm:7.2f}   "
+                        f"(tol ±{linear_tol_mm})"
                     )
-                    print("\n[ok] Linear position confirmed.")
+                    print(line, end="", flush=True)
+
+                    if enter_pressed_nonblocking():
+                        if abs(error_mm) <= linear_tol_mm:
+                            linear_time_ms = int(
+                                (time.perf_counter() - linear_start_time) * 1000
+                            )
+                            print("\n[ok] Linear position confirmed.")
+                            append_event(
+                                log_path,
+                                {
+                                    "ts": now_iso_local(),
+                                    "event": "linear_confirm",
+                                    "design_file": design_path.name,
+                                    "tube_id": tube_id,
+                                    "joint_id": joint_id,
+                                    "joint_type": joint_type,
+                                    "ori": joint_orientation,
+                                    "joint_seq": joint_index,
+                                    "target_mm": target_mm,
+                                    "measured_mm_raw": raw_sensor_mm,
+                                    "measured_mm": measured_sensor_mm,
+                                    "error_mm": error_mm,
+                                    "tol_mm": linear_tol_mm,
+                                    "linear_time_ms": linear_time_ms,
+                                },
+                            )
+                            break
+                        else:
+                            print(
+                                "\n[warn] Outside tolerance. Keep adjusting "
+                                "and press ENTER again."
+                            )
+
+                    time.sleep(0.1)
+
+                # ROTATING_J2 (with stall detection)
+                rotation_start_time = time.perf_counter()
+
+                # Enable stall detection before moving
+                if stall_enabled:
+                    motor.write_stall_params(
+                        mode=0x01,
+                        speed_rpm=stall_speed_rpm,
+                        current_ma=stall_current_ma,
+                        time_ms=stall_time_ms,
+                        store=False,
+                    )
+
+                stall_occurred = False
+                while True:
+                    motor.move_absolute_deg_output(
+                        rotation_deg, speed_rpm=rot_speed_rpm, acc=rot_acc
+                    )
+
+                    # Poll until reached or stall
+                    ok = False
+                    t0 = time.time()
+                    while True:
+                        flags = motor.read_status_flags()
+                        if flags & motor.FLAG_STALL_PROTECTED:
+                            # Stall protection triggered
+                            stall_occurred = True
+                            break
+                        if flags & motor.FLAG_REACHED:
+                            ok = True
+                            break
+                        if (time.time() - t0) >= 20.0:
+                            break
+                        time.sleep(motor.poll_period_s)
+
+                    if not stall_occurred:
+                        break
+
+                    # Handle stall: log, prompt operator, recover, retry
+                    print(
+                        "\n[STALL] Motor stall detected! The rotation axis "
+                        "may be blocked."
+                    )
                     append_event(
                         log_path,
                         {
                             "ts": now_iso_local(),
-                            "event": "linear_confirm",
+                            "event": "stall_detected",
                             "design_file": design_path.name,
                             "tube_id": tube_id,
                             "joint_id": joint_id,
                             "joint_type": joint_type,
                             "ori": joint_orientation,
                             "joint_seq": joint_index,
-                            "target_mm": target_mm,
-                            "measured_mm_raw": raw_sensor_mm,
-                            "measured_mm": measured_sensor_mm,
-                            "error_mm": error_mm,
-                            "tol_mm": linear_tol_mm,
-                            "linear_time_ms": linear_time_ms,
+                            "target_deg": rotation_deg,
                         },
                     )
-                    break
-                else:
-                    print(
-                        "\n[warn] Outside tolerance. Keep adjusting and press ENTER again."
+                    motor.clear_stall_protection()
+                    time.sleep(0.1)
+                    motor.set_enabled(True)
+                    time.sleep(0.1)
+
+                    input(
+                        "[STALL] Clear the obstruction, then press ENTER "
+                        "to retry the rotation... "
+                    )
+                    stall_occurred = False  # reset for retry
+
+                # Disable stall detection (restore high current for holding)
+                if stall_enabled:
+                    motor.write_stall_params(
+                        mode=0x01,
+                        speed_rpm=stall_speed_rpm,
+                        current_ma=stall_disabled_current_ma,
+                        time_ms=stall_time_ms,
+                        store=False,
                     )
 
-            time.sleep(0.1)
+                rotation_time_ms = int(
+                    (time.perf_counter() - rotation_start_time) * 1000
+                )
+                actual_rotation_deg = motor.read_realtime_position_deg_output()
 
-        # ROTATING_J2: command motor to move and wait until it reports arrival
-        rotation_start_time = time.perf_counter()
-        motor.move_absolute_deg_output(
-            rotation_deg, speed_rpm=rot_speed_rpm, acc=rot_acc
-        )
+                print(
+                    f"[rot] reached={ok} target={rotation_deg:.2f}° "
+                    f"actual={actual_rotation_deg:.2f}° time={rotation_time_ms}ms"
+                )
 
-        ok = motor.wait_until_reached(timeout_s=20.0)
-        rotation_time_ms = int((time.perf_counter() - rotation_start_time) * 1000)
-        actual_rotation_deg = motor.read_realtime_position_deg_output()
+                append_event(
+                    log_path,
+                    {
+                        "ts": now_iso_local(),
+                        "event": "rotation_reached",
+                        "design_file": design_path.name,
+                        "tube_id": tube_id,
+                        "joint_id": joint_id,
+                        "joint_type": joint_type,
+                        "ori": joint_orientation,
+                        "joint_seq": joint_index,
+                        "target_deg": rotation_deg,
+                        "actual_deg": actual_rotation_deg,
+                        "tol_deg": rot_tol_deg,
+                        "rot_speed_rpm": rot_speed_rpm,
+                        "rot_acc": rot_acc,
+                        "rotation_time_ms": rotation_time_ms,
+                        "motor_reached_flag": bool(ok),
+                    },
+                )
 
-        print(
-            f"[rot] reached={ok} target={rotation_deg:.2f}° actual={actual_rotation_deg:.2f}° time={rotation_time_ms}ms"
-        )
+                # INSTALLING
+                print(
+                    f"\nInstall joint now: type={joint_type} ori={joint_orientation}. "
+                    f"Press ENTER when installed."
+                )
+                install_start_time = time.perf_counter()
+                input()
+                install_time_ms = int(
+                    (time.perf_counter() - install_start_time) * 1000
+                )
 
-        append_event(
-            log_path,
-            {
-                "ts": now_iso_local(),
-                "event": "rotation_reached",
-                "design_file": design_path.name,
-                "tube_id": tube_id,
-                "joint_id": joint_id,
-                "joint_type": joint_type,
-                "ori": joint_orientation,
-                "joint_seq": joint_index,
-                "target_deg": rotation_deg,
-                "actual_deg": actual_rotation_deg,
-                "tol_deg": rot_tol_deg,
-                "rot_speed_rpm": rot_speed_rpm,
-                "rot_acc": rot_acc,
-                "rotation_time_ms": rotation_time_ms,
-                "motor_reached_flag": bool(ok),
-            },
-        )
+                append_event(
+                    log_path,
+                    {
+                        "ts": now_iso_local(),
+                        "event": "install_confirm",
+                        "design_file": design_path.name,
+                        "tube_id": tube_id,
+                        "joint_id": joint_id,
+                        "joint_type": joint_type,
+                        "ori": joint_orientation,
+                        "joint_seq": joint_index,
+                        "install_time_ms": install_time_ms,
+                    },
+                )
 
-        # INSTALLING
-        # INSTALLING: human operator steps in
-        print(
-            f"\nInstall joint now: type={joint_type} ori={joint_orientation}. Press ENTER when installed."
-        )
-        install_start_time = time.perf_counter()
-        input()
-        install_time_ms = int((time.perf_counter() - install_start_time) * 1000)
+            # Tube complete
+            total_tube_time_ms = int(
+                (time.perf_counter() - tube_start_time) * 1000
+            )
+            append_event(
+                log_path,
+                {
+                    "ts": now_iso_local(),
+                    "event": "tube_complete",
+                    "design_file": design_path.name,
+                    "tube_id": tube_id,
+                    "joint_id": None,
+                    "joint_type": None,
+                    "ori": None,
+                    "joint_seq": None,
+                    "tube_time_ms": total_tube_time_ms,
+                    "completed": True,
+                },
+            )
 
-        append_event(
-            log_path,
-            {
-                "ts": now_iso_local(),
-                "event": "install_confirm",
-                "design_file": design_path.name,
-                "tube_id": tube_id,
-                "joint_id": joint_id,
-                "joint_type": joint_type,
-                "ori": joint_orientation,
-                "joint_seq": joint_index,
-                "install_time_ms": install_time_ms,
-            },
-        )
+            tubes_completed += 1
+            print("\n" + "=" * 60)
+            print(
+                f"Tube complete: {tube_id} | "
+                f"time = {total_tube_time_ms/1000:.1f}s | "
+                f"session total = {tubes_completed} tube(s)"
+            )
+            print(f"Log written to: {log_path}")
+            # Loop back to tube selection
 
-    # DONE
-    total_tube_time_ms = int((time.perf_counter() - tube_start_time) * 1000)
-    append_event(
-        log_path,
-        {
-            "ts": now_iso_local(),
-            "event": "tube_complete",
-            "design_file": design_path.name,
-            "tube_id": tube_id,
-            "joint_id": None,
-            "joint_type": None,
-            "ori": None,
-            "joint_seq": None,
-            "tube_time_ms": total_tube_time_ms,
-            "completed": True,
-        },
-    )
+    except KeyboardInterrupt:
+        print("\n\n[abort] Interrupted by operator (Ctrl+C).")
 
-    print("\n" + "=" * 60)
-    print(f"Tube complete: {tube_id} | total time = {total_tube_time_ms/1000:.1f}s")
-    print(f"Log written to: {log_path}")
-
-    client.close()
-    print("[exit] Serial port closed.")
+    finally:
+        print(f"\nSession summary: {tubes_completed} tube(s) completed.")
+        client.close()
+        print("[exit] Serial port closed.")
 
 
 if __name__ == "__main__":
