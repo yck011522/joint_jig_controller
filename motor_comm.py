@@ -62,11 +62,24 @@ class ZDTEmmMotor:
     REG_REALTIME_POS = 0x0036
     REG_STATUS_FLAGS = 0x003A
 
+    # Driver config block (Emm): read at 0x0042 (15 regs), write at 0x0048 (15 regs)
+    REG_DRIVER_CONFIG_READ = 0x0042
+    REG_DRIVER_CONFIG_WRITE = 0x0048
+    DRIVER_CONFIG_REG_COUNT = 15
+
     # Action command registers
     REG_ZERO_HERE = 0x000A
+    REG_CLEAR_PROTECTION = 0x000E
+    REG_ENABLE_CONTROL = 0x00F3
 
     # Position-mode control block (Emm)
     REG_POSMODE_BASE = 0x00FD
+
+    # Status flag bitmasks
+    FLAG_ENABLED = 0x01       # Ens_TF bit0
+    FLAG_REACHED = 0x02       # Prf_TF bit1
+    FLAG_STALL_DETECTED = 0x04   # Cgi_TF bit2 — stall condition met
+    FLAG_STALL_PROTECTED = 0x08  # Cgp_TF bit3 — stall protection triggered, motor released
 
     def __init__(
         self,
@@ -142,11 +155,21 @@ class ZDTEmmMotor:
 
     def is_enabled(self) -> bool:
         flags = self.read_status_flags()
-        return bool(flags & 0x01)  # Ens_TF bit0 :contentReference[oaicite:13]{index=13}
+        return bool(flags & self.FLAG_ENABLED)
 
     def is_reached(self) -> bool:
         flags = self.read_status_flags()
-        return bool(flags & 0x02)  # Prf_TF bit1 :contentReference[oaicite:14]{index=14}
+        return bool(flags & self.FLAG_REACHED)
+
+    def is_stall_detected(self) -> bool:
+        """True when real-time speed < threshold AND current > threshold (Cgi_TF bit2)."""
+        flags = self.read_status_flags()
+        return bool(flags & self.FLAG_STALL_DETECTED)
+
+    def is_stall_protection_triggered(self) -> bool:
+        """True when stall persisted beyond time threshold and motor was released (Cgp_TF bit3)."""
+        flags = self.read_status_flags()
+        return bool(flags & self.FLAG_STALL_PROTECTED)
 
     # -------------------------
     # Actions
@@ -155,6 +178,90 @@ class ZDTEmmMotor:
         """Clears current angle (target + realtime) by writing 0x000A = 1. :contentReference[oaicite:15]{index=15}"""
         resp = self.client.write_register(self.REG_ZERO_HERE, 0x0001, slave=self.slave_id)
         self._require_ok(resp, "zero_here")
+
+    # -------------------------
+    # Stall protection & enable control
+    # -------------------------
+    def clear_stall_protection(self) -> None:
+        """Release stall/overheat/overcurrent protection (register 0x000E)."""
+        resp = self.client.write_register(self.REG_CLEAR_PROTECTION, 0x0052, slave=self.slave_id)
+        self._require_ok(resp, "clear_stall_protection")
+
+    def set_enabled(self, enable: bool, *, sync: int = 0) -> None:
+        """Enable (True) or disable (False) the motor driver via register 0x00F3."""
+        enable_byte = 0x01 if enable else 0x00
+        reg1 = (0xAB << 8) | enable_byte
+        reg2 = int(sync) & 0xFFFF
+        resp = self.client.write_registers(
+            self.REG_ENABLE_CONTROL, [reg1, reg2], slave=self.slave_id
+        )
+        self._require_ok(resp, f"set_enabled({enable})")
+
+    def read_driver_config(self) -> list[int]:
+        """Read the full 15-register Emm driver config block starting at 0x0042."""
+        resp = self.client.read_holding_registers(
+            self.REG_DRIVER_CONFIG_READ, count=self.DRIVER_CONFIG_REG_COUNT, slave=self.slave_id
+        )
+        self._require_ok(resp, "read_driver_config")
+        regs = list(resp.registers)
+        if len(regs) != self.DRIVER_CONFIG_REG_COUNT:
+            raise MotorCommError(
+                f"read_driver_config: expected {self.DRIVER_CONFIG_REG_COUNT} regs, got {len(regs)}: {regs}"
+            )
+        return regs
+
+    def read_stall_params(self) -> dict:
+        """Read current stall protection parameters from the driver config.
+
+        Returns dict with keys: mode, speed_rpm, current_ma, time_ms.
+        """
+        regs = self.read_driver_config()
+        return {
+            "mode": regs[10] & 0xFF,           # low byte of reg[10]
+            "speed_rpm": regs[11],              # reg[11] full 16-bit
+            "current_ma": regs[12],             # reg[12] full 16-bit
+            "time_ms": regs[13],                # reg[13] full 16-bit
+        }
+
+    def write_stall_params(
+        self,
+        *,
+        mode: int = 0x01,
+        speed_rpm: int = 100,
+        current_ma: int = 400,
+        time_ms: int = 50,
+        store: bool = False,
+    ) -> None:
+        """Write stall protection parameters via read-modify-write of the driver config.
+
+        Args:
+            mode: 0x00=off, 0x01=enable (release motor on stall), 0x02=reset-to-zero
+            speed_rpm: stall detection speed threshold (0–3000)
+            current_ma: stall detection current threshold (0–5000)
+            time_ms: stall detection duration threshold (0–65535)
+            store: if True, persist to EEPROM; if False, volatile only
+        """
+        regs = self.read_driver_config()
+
+        # Prepare the write block: reg[0] gets aux code 0xD1 + store flag
+        store_flag = 0x01 if store else 0x00
+        write_regs = list(regs)
+        write_regs[0] = (0xD1 << 8) | store_flag
+
+        # Modify stall parameters (regs 10–13)
+        # reg[10]: preserve response_mode (high byte), set stall_protection_mode (low byte)
+        write_regs[10] = (regs[10] & 0xFF00) | (int(mode) & 0xFF)
+        write_regs[11] = int(speed_rpm) & 0xFFFF
+        write_regs[12] = int(current_ma) & 0xFFFF
+        write_regs[13] = int(time_ms) & 0xFFFF
+
+        # reg[9]: clear high byte (reserved) per spec for writes
+        write_regs[9] = write_regs[9] & 0x00FF
+
+        resp = self.client.write_registers(
+            self.REG_DRIVER_CONFIG_WRITE, write_regs, slave=self.slave_id
+        )
+        self._require_ok(resp, "write_stall_params")
 
     def move_relative_pulses_motor(
         self,
