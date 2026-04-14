@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Tuple, Optional
 
 from pymodbus.client import ModbusSerialClient
+import serial.tools.list_ports
 
 from distance_sensor import DistanceSensor
 from motor_comm import ZDTEmmMotor, MotorKinematics
@@ -142,6 +143,162 @@ def enter_pressed_nonblocking() -> bool:
 
 
 # ----------------------------
+# COM port auto-detection
+# ----------------------------
+def _list_available_ports() -> list:
+    """Return list of serial port info objects, sorted by device name."""
+    return sorted(serial.tools.list_ports.comports(), key=lambda p: p.device)
+
+
+def _try_probe_devices(
+    port: str,
+    *,
+    baudrate: int,
+    timeout_s: float,
+    parity: str,
+    stopbits: int,
+    bytesize: int,
+    sensor_addr: int,
+    motor_addr: int,
+) -> Tuple[Optional[ModbusSerialClient], Optional[int], Optional[float], str]:
+    """Try to connect to *port* and probe sensor + motor.
+
+    Returns (client, sensor_mm, motor_deg, status_msg).
+    *client* is the opened ModbusSerialClient on success, else None.
+    status_msg is one of: "both_ok", "sensor_only", "no_devices", "connect_fail".
+    """
+    client = ModbusSerialClient(
+        port=port,
+        baudrate=baudrate,
+        parity=parity,
+        stopbits=stopbits,
+        bytesize=bytesize,
+        timeout=timeout_s,
+    )
+    if not client.connect():
+        return None, None, None, "connect_fail"
+
+    sensor = DistanceSensor(client, slave_id=sensor_addr)
+    motor = ZDTEmmMotor(client, slave_id=motor_addr)
+
+    sensor_mm: Optional[int] = None
+    motor_deg: Optional[float] = None
+
+    # Probe sensor
+    try:
+        sensor_mm = sensor.read_mm()
+    except Exception:
+        pass
+
+    # Probe motor
+    try:
+        motor_deg = motor.read_realtime_position_deg_output()
+    except Exception:
+        pass
+
+    if sensor_mm is not None and motor_deg is not None:
+        return client, sensor_mm, motor_deg, "both_ok"
+
+    if sensor_mm is not None and motor_deg is None:
+        # Sensor responds but motor doesn't — correct bus, motor issue
+        client.close()
+        return None, sensor_mm, None, "sensor_only"
+
+    # Neither device responded — wrong bus or unrelated serial device
+    client.close()
+    return None, None, None, "no_devices"
+
+
+def auto_detect_port(
+    settings: dict,
+) -> Tuple[ModbusSerialClient, int, float]:
+    """Scan available COM ports and return (client, sensor_mm, motor_deg).
+
+    Uses settings for baud/parity/etc and device addresses.
+    Raises RuntimeError with a diagnostic message if detection fails.
+    """
+    baudrate = int(safe_get(settings, ["serial", "baudrate"], default=115200))
+    timeout_s = float(safe_get(settings, ["serial", "timeout_s"], default=0.4))
+    parity = str(safe_get(settings, ["serial", "parity"], default="N"))
+    stopbits = int(safe_get(settings, ["serial", "stopbits"], default=1))
+    bytesize = int(safe_get(settings, ["serial", "bytesize"], default=8))
+    sensor_addr = int(safe_get(settings, ["device_addresses", "sensor_addr"], default=1))
+    motor_addr = int(safe_get(settings, ["device_addresses", "motor_addr"], default=2))
+
+    all_ports = _list_available_ports()
+    if not all_ports:
+        raise RuntimeError(
+            "No COM ports found on this system.\n"
+            "  - Check that the USB-RS485 adapter is plugged in.\n"
+            "  - On Windows, check Device Manager → Ports (COM & LPT)."
+        )
+
+    print(f"[probe] Found {len(all_ports)} COM port(s): "
+          + ", ".join(f"{p.device} ({p.description})" for p in all_ports))
+
+    sensor_only_port: Optional[str] = None
+    connect_fail_ports: list[str] = []
+
+    for port_info in all_ports:
+        port = port_info.device
+        print(f"[probe] Trying {port} ...", end=" ", flush=True)
+
+        client, sensor_mm, motor_deg, status = _try_probe_devices(
+            port,
+            baudrate=baudrate,
+            timeout_s=timeout_s,
+            parity=parity,
+            stopbits=stopbits,
+            bytesize=bytesize,
+            sensor_addr=sensor_addr,
+            motor_addr=motor_addr,
+        )
+
+        if status == "both_ok":
+            print(f"OK  (sensor={sensor_mm} mm, motor={motor_deg:.3f} deg)")
+            return client, sensor_mm, motor_deg
+
+        if status == "sensor_only":
+            print(f"sensor OK ({sensor_mm} mm) but MOTOR NOT RESPONDING")
+            sensor_only_port = port
+
+        elif status == "connect_fail":
+            desc = port_info.description or ""
+            # Detect likely "port in use" vs genuinely unavailable
+            print(f"cannot open (may be in use by another application)")
+            connect_fail_ports.append(f"{port} ({desc})")
+
+        else:  # no_devices
+            print("no Modbus devices responded")
+
+    # --- Build a helpful error message ---
+    lines = ["Could not automatically detect the hardware."]
+
+    if sensor_only_port:
+        lines.append(
+            f"\n  On {sensor_only_port} the distance sensor responded but the motor did NOT."
+        )
+        lines.append("  - Check the motor RS-485 wiring and power supply.")
+        lines.append("  - Verify the motor Modbus address matches settings.json "
+                      f"(expected slave {motor_addr}).")
+
+    if connect_fail_ports:
+        lines.append("\n  The following port(s) could not be opened (possibly in use):")
+        for p in connect_fail_ports:
+            lines.append(f"    {p}")
+        lines.append("  - Close any other application that may hold the port "
+                      "(e.g. motor tuning software, serial monitor).")
+
+    lines.append(f"\n  Available ports: "
+                 + ", ".join(f"{p.device}" for p in all_ports))
+    lines.append("  Baud rate: " + str(baudrate))
+    lines.append("  Expected sensor address: " + str(sensor_addr))
+    lines.append("  Expected motor address: " + str(motor_addr))
+
+    raise RuntimeError("\n".join(lines))
+
+
+# ----------------------------
 # CLI flow
 # ----------------------------
 def main():
@@ -156,10 +313,9 @@ def main():
         raise RuntimeError(f"settings.json not found next to script: {settings_path}")
     settings = load_json(settings_path)
 
-    # --- 2) Connect Modbus client (fixed port for now) ---
-    port = safe_get(settings, ["serial", "port"], default=None)
-    if not port:
-        raise RuntimeError("settings.serial.port is required for CLI v0 (fixed port).")
+    # --- 2) Connect Modbus client (auto-detect or fixed port) ---
+    probe_enabled = bool(safe_get(settings, ["probe", "enabled"], default=True))
+    fixed_port = safe_get(settings, ["serial", "port"], default=None)
 
     baudrate = int(safe_get(settings, ["serial", "baudrate"], default=115200))
     timeout_s = float(safe_get(settings, ["serial", "timeout_s"], default=0.4))
@@ -167,23 +323,6 @@ def main():
     stopbits = int(safe_get(settings, ["serial", "stopbits"], default=1))
     bytesize = int(safe_get(settings, ["serial", "bytesize"], default=8))
 
-    client = ModbusSerialClient(
-        port=port,
-        baudrate=baudrate,
-        parity=parity,
-        stopbits=stopbits,
-        bytesize=bytesize,
-        timeout=timeout_s,
-    )
-
-    print(f"[init] Opening Modbus RTU on {port} @ {baudrate} ...")
-    if not client.connect():
-        raise RuntimeError(
-            f"Failed to connect ModbusSerialClient on {port} @ {baudrate}"
-        )
-    print("[init] Modbus connected.")
-
-    # --- 3) Instantiate DistanceSensor + ZDTEmmMotor ---
     # device address configuration for Modbus slaves
     motor_address = int(
         safe_get(settings, ["device_addresses", "motor_addr"], default=2)
@@ -191,6 +330,38 @@ def main():
     sensor_address = int(
         safe_get(settings, ["device_addresses", "sensor_addr"], default=1)
     )
+
+    if probe_enabled:
+        print("[init] Auto-detecting COM port ...")
+        client, sensor_reading_mm, motor_reading_deg = auto_detect_port(settings)
+        port = client.comm_params.host  # retrieve the port that worked
+        print(f"[init] Hardware found on {port} @ {baudrate}")
+    else:
+        # Fall back to fixed port from settings
+        if not fixed_port:
+            raise RuntimeError(
+                "Probe disabled but settings.serial.port is not set. "
+                "Either enable probe or specify a COM port."
+            )
+        port = fixed_port
+        print(f"[init] Opening Modbus RTU on {port} @ {baudrate} (probe disabled) ...")
+        client = ModbusSerialClient(
+            port=port,
+            baudrate=baudrate,
+            parity=parity,
+            stopbits=stopbits,
+            bytesize=bytesize,
+            timeout=timeout_s,
+        )
+        if not client.connect():
+            raise RuntimeError(
+                f"Failed to connect ModbusSerialClient on {port} @ {baudrate}"
+            )
+        print("[init] Modbus connected.")
+        sensor_reading_mm = None
+        motor_reading_deg = None
+
+    # --- 3) Instantiate DistanceSensor + ZDTEmmMotor ---
 
     # Motor kinematics from settings
     motor_steps_per_rev = int(
@@ -209,19 +380,23 @@ def main():
     sensor = DistanceSensor(client, slave_id=sensor_address)
     motor = ZDTEmmMotor(client, slave_id=motor_address, kinematics=kinematics)
 
-    # Probe connectivity quickly
-    try:
-        # do a quick read from each device to ensure they're alive
-        sensor_reading_mm = sensor.read_mm()
-        motor_reading_deg = motor.read_realtime_position_deg_output()
+    # If we used auto-detect, devices were already probed; otherwise probe now
+    if sensor_reading_mm is not None and motor_reading_deg is not None:
         print(
             f"[probe] Sensor OK: {sensor_reading_mm} mm | Motor OK: {motor_reading_deg:.3f} deg (output)"
         )
-    except Exception as e:
-        client.close()
-        raise RuntimeError(
-            f"Hardware probe failed (sensor or motor not responding): {e!r}"
-        )
+    else:
+        try:
+            sensor_reading_mm = sensor.read_mm()
+            motor_reading_deg = motor.read_realtime_position_deg_output()
+            print(
+                f"[probe] Sensor OK: {sensor_reading_mm} mm | Motor OK: {motor_reading_deg:.3f} deg (output)"
+            )
+        except Exception as e:
+            client.close()
+            raise RuntimeError(
+                f"Hardware probe failed (sensor or motor not responding): {e!r}"
+            )
 
     # --- 4) Load design JSON (hardcoded) ---
     design_path = base_dir / "design" / "dummy.json"
