@@ -18,8 +18,8 @@
         "gear_ratio": 30.0,
         "motor_steps_per_rev": 200,
         "microsteps": 16,
-        "rot_speed_rpm": 30.0,
-        "rot_acc_rpm_s": 100.0,
+        "rot_speed_rpm": 300,
+        "rot_acc": 100,
         "rot_tol_deg": 1.0
     },
     "linear": {

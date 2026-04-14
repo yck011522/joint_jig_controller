@@ -449,10 +449,8 @@ def main():
         safe_get(settings, ["linear", "sensor_global_offset_mm"], default=0.0)
     )
 
-    rot_speed_rpm = float(safe_get(settings, ["motion", "rot_speed_rpm"], default=60.0))
-    rot_acc_rpm_s = float(
-        safe_get(settings, ["motion", "rot_acc_rpm_s"], default=100.0)
-    )
+    rot_speed_rpm = int(safe_get(settings, ["motion", "rot_speed_rpm"], default=300))
+    rot_acc = int(safe_get(settings, ["motion", "rot_acc"], default=100))
     rot_tol_deg = float(safe_get(settings, ["motion", "rot_tol_deg"], default=1.0))
 
     log_path = design_log_path(design_path, settings)
@@ -579,8 +577,8 @@ def main():
         # ROTATING_J2: command motor to move and wait until it reports arrival
         rotation_start_time = time.perf_counter()
         motor.move_absolute_deg_output(
-            rotation_deg, speed_rpm=200, acc=50
-        )  # speed/acc can be moved to settings later
+            rotation_deg, speed_rpm=rot_speed_rpm, acc=rot_acc
+        )
 
         ok = motor.wait_until_reached(timeout_s=20.0)
         rotation_time_ms = int((time.perf_counter() - rotation_start_time) * 1000)
@@ -605,7 +603,7 @@ def main():
                 "actual_deg": actual_rotation_deg,
                 "tol_deg": rot_tol_deg,
                 "rot_speed_rpm": rot_speed_rpm,
-                "rot_acc_rpm_s": rot_acc_rpm_s,
+                "rot_acc": rot_acc,
                 "rotation_time_ms": rotation_time_ms,
                 "motor_reached_flag": bool(ok),
             },
