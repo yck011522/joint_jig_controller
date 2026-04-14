@@ -440,6 +440,8 @@ class HardwareHub:
         self._lock = threading.Lock()
         self._poll_interval = poll_interval_s
         self._stop_event = threading.Event()
+        self._consecutive_errors: int = 0
+        self._MAX_CONSECUTIVE_ERRORS: int = 3
 
         # Cached readings — written only by the poller thread.
         # Reading a Python float/int attribute is atomic on CPython
@@ -452,6 +454,7 @@ class HardwareHub:
         self.stall_detected: bool = False
         self.stall_protected: bool = False
         self.poll_error: Optional[str] = None
+        self.connected: bool = True
         self.port: str = hw.port
 
         self._thread = threading.Thread(
@@ -463,6 +466,10 @@ class HardwareHub:
 
     def _poll_loop(self) -> None:
         while not self._stop_event.is_set():
+            if not self.connected:
+                # Don't hammer a dead connection; just idle.
+                self._stop_event.wait(0.5)
+                continue
             try:
                 with self._lock:
                     self.sensor_mm = self._hw.sensor.read_mm()
@@ -474,8 +481,12 @@ class HardwareHub:
                 self.stall_detected = bool(flags & self._hw.motor.FLAG_STALL_DETECTED)
                 self.stall_protected = bool(flags & self._hw.motor.FLAG_STALL_PROTECTED)
                 self.poll_error = None
+                self._consecutive_errors = 0
             except Exception as e:
                 self.poll_error = str(e)
+                self._consecutive_errors += 1
+                if self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS:
+                    self.connected = False
             self._stop_event.wait(self._poll_interval)
 
     def set_poll_interval(self, interval_s: float) -> None:
@@ -661,6 +672,39 @@ class HardwareHub:
         )
 
     # ── Lifecycle ────────────────────────────────────────────────
+
+    def reconnect(self, cfg: JigSettings) -> None:
+        """Close the dead connection and establish a new one.
+
+        Blocks until hardware is found or raises ``RuntimeError``.
+        The poller thread is restarted on success.
+        """
+        # Stop the current poller
+        self._stop_event.set()
+        self._thread.join(timeout=2.0)
+
+        # Close old client (best-effort)
+        try:
+            self._hw.close()
+        except Exception:
+            pass
+
+        # Establish a new connection (may raise)
+        hw = connect_hardware(cfg, log=lambda *a, **kw: None)
+
+        # Swap in the new hardware context
+        self._hw = hw
+        self.port = hw.port
+        self.poll_error = None
+        self.connected = True
+        self._consecutive_errors = 0
+
+        # Restart poller
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(
+            target=self._poll_loop, daemon=True, name="hw-hub-poller",
+        )
+        self._thread.start()
 
     def stop(self) -> None:
         """Stop the background poller thread."""

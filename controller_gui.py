@@ -584,6 +584,14 @@ class JigApp(tk.Tk):
         tk.Label(self.right_panel, textvariable=self.eng_conn_var,
                  bg="#e8e8e8", font=("Consolas", 9)).pack(anchor=tk.W, padx=10)
 
+        # Reconnect button — hidden by default, shown only on disconnect
+        self.reconnect_btn = tk.Button(
+            self.right_panel, text="Reconnect", command=self._on_reconnect,
+            bg="#FF9800", activebackground="#F57C00", fg="white",
+            font=("Segoe UI", 9, "bold"), padx=10, pady=2,
+        )
+        # Not packed yet — shown only when connection is lost
+
         # Motion settings display
         self._add_eng_label("Motion Settings")
         self.eng_motion_var = tk.StringVar(value="—")
@@ -638,11 +646,48 @@ class JigApp(tk.Tk):
         except RuntimeError as e:
             messagebox.showerror("Hardware Error", str(e))
             self.eng_conn_var.set("DISCONNECTED")
-            # Allow running without hardware for UI testing
-            return
+            self.reconnect_btn.pack(anchor=tk.W, padx=10, pady=(4, 0))
 
         # Start the GUI refresh loop (reads from hub + drains queues)
         self.after(GUI_DRAIN_MS, self._gui_tick)
+
+    # ─────────────────────────────────────────────────────────────
+    #  Reconnect
+    # ─────────────────────────────────────────────────────────────
+
+    def _on_reconnect(self) -> None:
+        """Attempt to reconnect to the hardware."""
+        self.reconnect_btn.configure(state=tk.DISABLED, text="Reconnecting...")
+        self.eng_conn_var.set("Reconnecting...")
+        self.update_idletasks()
+
+        def _do_reconnect() -> None:
+            try:
+                if self.hub:
+                    self.hub.reconnect(self.cfg)
+                else:
+                    hw = connect_hardware(self.cfg, log=lambda *a, **kw: None)
+                    self.hub = HardwareHub(hw, poll_interval_s=POLL_INTERVAL_S)
+                self.after(0, self._reconnect_success)
+            except Exception as e:
+                self.after(0, lambda: self._reconnect_failure(str(e)))
+
+        threading.Thread(target=_do_reconnect, daemon=True).start()
+
+    def _reconnect_success(self) -> None:
+        """Called on the main thread after a successful reconnect."""
+        self.eng_conn_var.set(
+            f"Port: {self.hub.port}\n"
+            f"Status: Connected"
+        )
+        self.reconnect_btn.pack_forget()
+        self.reconnect_btn.configure(state=tk.NORMAL, text="Reconnect")
+
+    def _reconnect_failure(self, error: str) -> None:
+        """Called on the main thread after a failed reconnect."""
+        self.eng_conn_var.set("DISCONNECTED")
+        self.reconnect_btn.configure(state=tk.NORMAL, text="Reconnect")
+        messagebox.showerror("Reconnect Failed", error)
 
     # ─────────────────────────────────────────────────────────────
     #  GUI tick — periodic refresh (replaces separate poll/drain)
@@ -654,7 +699,12 @@ class JigApp(tk.Tk):
 
         # ── Refresh engineer panel from hub ──────────────────────
         if self.hub:
-            if self.hub.poll_error:
+            if not self.hub.connected:
+                self.eng_sensor_var.set("DISCONNECTED")
+                self.eng_conn_var.set("DISCONNECTED")
+                if not self.reconnect_btn.winfo_ismapped():
+                    self.reconnect_btn.pack(anchor=tk.W, padx=10, pady=(4, 0))
+            elif self.hub.poll_error:
                 self.eng_sensor_var.set(f"ERR: {self.hub.poll_error[:40]}")
             else:
                 if self.hub.sensor_mm is not None:
