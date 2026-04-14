@@ -435,7 +435,7 @@ class HardwareHub:
         hub.stop()          # stop the poller
     """
 
-    def __init__(self, hw: HardwareContext, poll_interval_s: float = 0.5):
+    def __init__(self, hw: HardwareContext, poll_interval_s: float = 1 / 30):
         self._hw = hw
         self._lock = threading.Lock()
         self._poll_interval = poll_interval_s

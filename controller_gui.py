@@ -79,7 +79,7 @@ from jig_controller import (
 #  Constants
 # ═══════════════════════════════════════════════════════════════
 
-POLL_INTERVAL_S = 0.5       # HardwareHub background poll interval
+POLL_INTERVAL_S = 1 / 30    # HardwareHub background poll interval (~30 Hz)
 GUI_DRAIN_MS = 100          # how often the GUI drains the message queue
 WINDOW_TITLE = "Joint Jig Controller"
 WINDOW_MIN_SIZE = (1100, 700)
@@ -821,20 +821,60 @@ class JigApp(tk.Tk):
             abandoned = d.get("abandoned", False)
             tube_ms = d.get("tube_time_ms", 0)
             tid = d.get("tube_id", "")
-            if abandoned:
-                messagebox.showinfo("Tube Abandoned",
-                    f"Tube {tid} was abandoned.\n"
-                    f"Time elapsed: {format_duration_ms(tube_ms)}")
-            else:
-                messagebox.showinfo("Tube Complete",
-                    f"Tube {tid} assembly complete!\n"
-                    f"Total time: {format_duration_ms(tube_ms)}")
-            self._show_selection()
+            # Show an in-wizard completion page instead of a popup
+            self._show_done_page(tid, tube_ms, abandoned)
 
         elif msg.kind == "error":
             messagebox.showerror("Assembly Error",
                                  d.get("message", "Unknown"))
             self._show_selection()
+
+    # ─────────────────────────────────────────────────────────────
+    #  Tube done / abandoned page (replaces popup dialog)
+    # ─────────────────────────────────────────────────────────────
+
+    def _show_done_page(self, tube_id: str, tube_ms: int,
+                        abandoned: bool) -> None:
+        """Replace the assembly wizard content with a summary page
+        and a 'Back to Selection' button — no modal dialog."""
+
+        # Hide all variable assembly widgets
+        self.image_label.configure(image="", text="")
+        self._current_photo = None
+        self.bar_frame.pack_forget()
+        self.rot_progress_frame.pack_forget()
+        self.rot_progress_info_var.set("")
+        self.linear_info_var.set("")
+        self.confirm_btn.configure(state=tk.DISABLED)
+        self._confirm_action = None
+        self.abandon_btn.configure(state=tk.DISABLED)
+
+        # Title bar
+        self._title_prefix.configure(text="Tube: ")
+        self._title_tube_id.configure(text=tube_id)
+        self._title_mid.configure(text="")
+        self._title_joint_id.configure(text="")
+
+        duration = format_duration_ms(tube_ms)
+        if abandoned:
+            self.instruction_var.set(
+                f"Tube abandoned.\n\n"
+                f"Time elapsed: {duration}"
+            )
+            self.status_var.set("")
+        else:
+            self.instruction_var.set(
+                f"✓  Assembly complete!\n\n"
+                f"Total time: {duration}"
+            )
+            self.status_var.set("")
+
+        # Re-label the confirm button as "Back to Selection"
+        self.confirm_btn.configure(
+            state=tk.NORMAL, text="Back to Selection",
+            bg="#607D8B", activebackground="#546E7A",
+        )
+        self._confirm_action = "back_to_selection"
 
     # ─────────────────────────────────────────────────────────────
     #  Linear position colour bar drawing
@@ -1146,6 +1186,13 @@ class JigApp(tk.Tk):
         elif action == "stall_retry":
             self.stall_retry_event.set()
             self.confirm_btn.configure(state=tk.DISABLED)
+        elif action == "back_to_selection":
+            # Restore default confirm button colours before switching
+            self.confirm_btn.configure(
+                bg="#2196F3", activebackground="#1976D2",
+            )
+            self.abandon_btn.configure(state=tk.NORMAL)
+            self._show_selection()
 
     def _on_abandon(self) -> None:
         """Signal the assembly worker to stop and return to selection."""

@@ -184,10 +184,23 @@ Current method: manual labeling
 
 # 4. Software Architecture
 
+## Environment Setup
+
 ```
-conda create -n joint_jig python=3.11 pymodbus=3.9.2 pyserial=3.5 pip -c conda-forge
+conda create -n joint_jig python=3.11 pip -c conda-forge
 conda activate joint_jig
+pip install -r requirements.txt
 ```
+
+### Dependencies
+
+| Package    | Purpose                                    |
+|------------|--------------------------------------------|
+| pymodbus   | Modbus RTU communication (motor + sensor)  |
+| pyserial   | Serial port enumeration and auto-detection |
+| Pillow     | JPEG joint reference images in the GUI     |
+
+All dependencies are listed in `requirements.txt`.
 
 ## 4.1 Supervisory Control Software (Python)
 
