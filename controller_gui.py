@@ -12,11 +12,11 @@ The engineer panel continuously displays sensor / motor / stall
 readings from the HardwareHub's cached values (updated every poll cycle).
 
 The left panel shows either:
-  A) Selection screen: design-file picker, tube table, tube details,
+  A) Selection screen: design-file picker, bar table, bar details,
      "Start Assembly" button.
   B) Assembly wizard: joint image at top (visible across all steps),
      step-by-step workflow with linear colour bar, rotation progress bar,
-     and "Abandon Tube" button.
+     and "Abandon Bar" button.
 
 Threading model:
   - A ``HardwareHub`` (from jig_controller.py) owns the Modbus lock
@@ -42,20 +42,20 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from jig_controller import (
+    EVENT_BAR_ABANDONED,
+    EVENT_BAR_INSTALL_COMPLETE,
+    EVENT_BAR_START,
     EVENT_INSTALL_CONFIRM,
     EVENT_LINEAR_CONFIRM,
     EVENT_ROTATION_REACHED,
     EVENT_STALL_DETECTED,
-    EVENT_TUBE_ABANDONED,
-    EVENT_TUBE_INSTALL_COMPLETE,
-    EVENT_TUBE_START,
+    BarCompletionInfo,
     HardwareContext,
     HardwareHub,
     JigSettings,
     MotionSettings,
     RotationResult,
     StallSettings,
-    TubeCompletionInfo,
     append_event,
     build_offset_map,
     connect_hardware,
@@ -63,8 +63,9 @@ from jig_controller import (
     ensure_schema_version,
     format_duration_ms,
     format_time_ago,
+    get_bar_completion_map,
     get_last_design_dir,
-    get_tube_completion_map,
+    joint_type_key,
     load_json,
     now_iso_local,
     parse_log_events,
@@ -105,7 +106,7 @@ class AssemblyMsg:
 # ═══════════════════════════════════════════════════════════════
 
 class AssemblyWorker(threading.Thread):
-    """Drives the tube assembly workflow in a background thread.
+    """Drives the bar assembly workflow in a background thread.
 
     All hardware I/O goes through the ``HardwareHub``.  Posts
     ``AssemblyMsg`` objects so the GUI can update.  The GUI can set
@@ -116,8 +117,8 @@ class AssemblyWorker(threading.Thread):
         self,
         hub: HardwareHub,
         msg_queue: queue.Queue,
-        tube: dict,
-        tube_id: str,
+        bar: dict,
+        bar_id: str,
         joints: List[dict],
         offset_map: Dict,
         cfg: JigSettings,
@@ -133,8 +134,8 @@ class AssemblyWorker(threading.Thread):
         super().__init__(daemon=True, name="assembly-worker")
         self.hub = hub
         self.q = msg_queue
-        self.tube = tube
-        self.tube_id = tube_id
+        self.bar = bar
+        self.bar_id = bar_id
         self.joints = joints
         self.offset_map = offset_map
         self.cfg = cfg
@@ -163,17 +164,17 @@ class AssemblyWorker(threading.Thread):
             self._post("error", message=str(e))
 
     def _run_assembly(self) -> None:
-        # Zero motor at the start of each tube
+        # Zero motor at the start of each bar
         self.hub.zero_here()
 
-        tube_start = time.perf_counter()
+        bar_start = time.perf_counter()
 
         self._log_event({
             "ts": now_iso_local(),
-            "event": EVENT_TUBE_START,
+            "event": EVENT_BAR_START,
             "design_file": self.design_path.name,
-            "tube_id": self.tube_id,
-            "tube_length_mm": float(self.tube.get("length", 0)),
+            "bar_id": self.bar_id,
+            "bar_length_mm": float(self.bar.get("length_mm", 0)),
             "num_joints": len(self.joints),
         })
 
@@ -183,18 +184,22 @@ class AssemblyWorker(threading.Thread):
             if self.abandon.is_set():
                 break
 
-            joint_id = str(joint.get("id", f"joint_{ji}"))
-            joint_type = str(joint.get("type", "")).strip()
+            joint_id = str(joint.get("joint_id", f"joint_{ji}"))
+            jtype_key = joint_type_key(joint)  # e.g. "T20_Female"
+            joint_type_raw = str(joint.get("type", "")).strip()
+            joint_subtype = str(joint.get("subtype", "")).strip()
             joint_ori = str(joint.get("ori", "")).strip()
             position_mm = float(joint.get("position_mm", 0.0))
             rotation_deg = float(joint.get("rotation_deg", 0.0))
 
-            joint_offset = self.offset_map.get((joint_type, joint_ori), 0.0)
-            target_mm = position_mm + self.cfg.linear.sensor_global_offset_mm + joint_offset
+            joint_offset = self.offset_map.get((jtype_key, joint_ori), 0.0)
+            target_mm = position_mm - joint_offset
 
             # Tell the GUI we're starting a new joint (image + title)
             self._post("joint_start", joint_index=ji, joint_total=len(self.joints),
-                        joint_id=joint_id, joint_type=joint_type, joint_ori=joint_ori,
+                        joint_id=joint_id, joint_type=jtype_key,
+                        joint_type_display=f"{joint_type_raw} {joint_subtype}".strip(),
+                        joint_ori=joint_ori,
                         position_mm=position_mm, target_mm=target_mm,
                         rotation_deg=rotation_deg)
 
@@ -229,8 +234,9 @@ class AssemblyWorker(threading.Thread):
                 "ts": now_iso_local(),
                 "event": EVENT_LINEAR_CONFIRM,
                 "design_file": self.design_path.name,
-                "tube_id": self.tube_id,
-                "joint_id": joint_id, "joint_type": joint_type,
+                "bar_id": self.bar_id,
+                "joint_id": joint_id, "joint_type": joint_type_raw,
+                "joint_subtype": joint_subtype,
                 "ori": joint_ori, "joint_seq": ji,
                 "target_mm": target_mm, "measured_mm_raw": raw_mm,
                 "measured_mm": measured, "error_mm": error,
@@ -253,8 +259,9 @@ class AssemblyWorker(threading.Thread):
                     "ts": now_iso_local(),
                     "event": EVENT_STALL_DETECTED,
                     "design_file": self.design_path.name,
-                    "tube_id": self.tube_id,
-                    "joint_id": joint_id, "joint_type": joint_type,
+                    "bar_id": self.bar_id,
+                    "joint_id": joint_id, "joint_type": joint_type_raw,
+                    "joint_subtype": joint_subtype,
                     "ori": joint_ori, "joint_seq": ji,
                     "target_deg": target, "actual_deg": actual_deg,
                     "time_since_motion_start_ms": elapsed_ms,
@@ -279,8 +286,9 @@ class AssemblyWorker(threading.Thread):
                 "ts": now_iso_local(),
                 "event": EVENT_ROTATION_REACHED,
                 "design_file": self.design_path.name,
-                "tube_id": self.tube_id,
-                "joint_id": joint_id, "joint_type": joint_type,
+                "bar_id": self.bar_id,
+                "joint_id": joint_id, "joint_type": joint_type_raw,
+                "joint_subtype": joint_subtype,
                 "ori": joint_ori, "joint_seq": ji,
                 "target_deg": rotation_deg,
                 "actual_deg": rot_result.actual_deg,
@@ -297,7 +305,9 @@ class AssemblyWorker(threading.Thread):
 
             # ── INSTALL JOINT ────────────────────────────────────
             self._post("step", phase="install", joint_index=ji,
-                        joint_type=joint_type, joint_ori=joint_ori)
+                        joint_type=jtype_key,
+                        joint_type_display=f"{joint_type_raw} {joint_subtype}".strip(),
+                        joint_ori=joint_ori)
             self.confirm_install.clear()
             install_start = time.perf_counter()
 
@@ -312,38 +322,39 @@ class AssemblyWorker(threading.Thread):
                 "ts": now_iso_local(),
                 "event": EVENT_INSTALL_CONFIRM,
                 "design_file": self.design_path.name,
-                "tube_id": self.tube_id,
-                "joint_id": joint_id, "joint_type": joint_type,
+                "bar_id": self.bar_id,
+                "joint_id": joint_id, "joint_type": joint_type_raw,
+                "joint_subtype": joint_subtype,
                 "ori": joint_ori, "joint_seq": ji,
                 "install_time_ms": install_ms,
             })
             joints_completed += 1
 
-        # ── Tube finished (complete or abandoned) ────────────────
-        tube_ms = int((time.perf_counter() - tube_start) * 1000)
+        # ── Bar finished (complete or abandoned) ─────────────────
+        bar_ms = int((time.perf_counter() - bar_start) * 1000)
 
         if self.abandon.is_set():
             self._log_event({
                 "ts": now_iso_local(),
-                "event": EVENT_TUBE_ABANDONED,
+                "event": EVENT_BAR_ABANDONED,
                 "design_file": self.design_path.name,
-                "tube_id": self.tube_id,
-                "tube_time_ms": tube_ms,
+                "bar_id": self.bar_id,
+                "bar_time_ms": bar_ms,
                 "joints_completed": joints_completed,
                 "joints_total": len(self.joints),
             })
-            self._post("done", abandoned=True, tube_id=self.tube_id,
-                        tube_time_ms=tube_ms)
+            self._post("done", abandoned=True, bar_id=self.bar_id,
+                        bar_time_ms=bar_ms)
         else:
             self._log_event({
                 "ts": now_iso_local(),
-                "event": EVENT_TUBE_INSTALL_COMPLETE,
+                "event": EVENT_BAR_INSTALL_COMPLETE,
                 "design_file": self.design_path.name,
-                "tube_id": self.tube_id,
-                "tube_time_ms": tube_ms,
+                "bar_id": self.bar_id,
+                "bar_time_ms": bar_ms,
             })
-            self._post("done", abandoned=False, tube_id=self.tube_id,
-                        tube_time_ms=tube_ms)
+            self._post("done", abandoned=False, bar_id=self.bar_id,
+                        bar_time_ms=bar_ms)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -368,7 +379,7 @@ class JigApp(tk.Tk):
         # Design / log state
         self.design_path: Optional[Path] = None
         self.design: Optional[dict] = None
-        self.tubes: List[dict] = []
+        self.bars: List[dict] = []
         self.log_path: Optional[Path] = None
         self.offset_map: Dict = {}
 
@@ -422,34 +433,34 @@ class JigApp(tk.Tk):
         tk.Button(file_row, text="Open...", command=self._on_open_design,
                   font=("Segoe UI", 9)).pack(side=tk.LEFT)
 
-        # Tube table
+        # Bar table
         table_frame = tk.Frame(self.selection_frame, bg="#f0f0f0")
         table_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
         columns = ("id", "length", "joints", "status")
-        self.tube_tree = ttk.Treeview(table_frame, columns=columns,
+        self.bar_tree = ttk.Treeview(table_frame, columns=columns,
                                        show="headings", selectmode="browse")
-        self.tube_tree.heading("id", text="Tube ID",
+        self.bar_tree.heading("id", text="Bar ID",
                                 command=lambda: self._sort_tree("id"))
-        self.tube_tree.heading("length", text="Length (mm)",
+        self.bar_tree.heading("length", text="Length (mm)",
                                 command=lambda: self._sort_tree("length"))
-        self.tube_tree.heading("joints", text="Joints",
+        self.bar_tree.heading("joints", text="Joints",
                                 command=lambda: self._sort_tree("joints"))
-        self.tube_tree.heading("status", text="Last Assembled",
+        self.bar_tree.heading("status", text="Last Assembled",
                                 command=lambda: self._sort_tree("status"))
-        self.tube_tree.column("id", width=100)
-        self.tube_tree.column("length", width=100, anchor=tk.E)
-        self.tube_tree.column("joints", width=70, anchor=tk.E)
-        self.tube_tree.column("status", width=250)
+        self.bar_tree.column("id", width=100)
+        self.bar_tree.column("length", width=100, anchor=tk.E)
+        self.bar_tree.column("joints", width=70, anchor=tk.E)
+        self.bar_tree.column("status", width=250)
 
         scrollbar = ttk.Scrollbar(table_frame, orient=tk.VERTICAL,
-                                   command=self.tube_tree.yview)
-        self.tube_tree.configure(yscrollcommand=scrollbar.set)
-        self.tube_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+                                   command=self.bar_tree.yview)
+        self.bar_tree.configure(yscrollcommand=scrollbar.set)
+        self.bar_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.tube_tree.bind("<<TreeviewSelect>>", self._on_tube_select)
+        self.bar_tree.bind("<<TreeviewSelect>>", self._on_bar_select)
 
-        # Tube details text (shown below table when a row is selected)
+        # Bar details text (shown below table when a row is selected)
         self.detail_label = tk.Label(
             self.selection_frame, text="", bg="#f0f0f0", justify=tk.LEFT,
             font=("Consolas", 9), anchor=tk.NW, wraplength=600,
@@ -458,7 +469,7 @@ class JigApp(tk.Tk):
 
         # Start Assembly button
         self.start_btn = tk.Button(
-            self.selection_frame, text="▶  Start Assembly",
+            self.selection_frame, text="\u25b6  Start Assembly",
             font=("Segoe UI", 12, "bold"), state=tk.DISABLED,
             command=self._on_start_assembly, bg="#4CAF50", fg="white",
             activebackground="#45a049", padx=20, pady=8,
@@ -471,19 +482,19 @@ class JigApp(tk.Tk):
         # ── Assembly wizard (Screen B) ───────────────────────────
         self.assembly_frame = tk.Frame(self.left_container, bg="#f0f0f0")
 
-        # Top bar: tube/joint info + abandon button
+        # Top bar: bar/joint info + abandon button
         top_bar = tk.Frame(self.assembly_frame, bg="#ddd")
         top_bar.pack(fill=tk.X)
 
         # Title uses a frame with separate labels so only IDs are bold
         title_frame = tk.Frame(top_bar, bg="#ddd")
         title_frame.pack(side=tk.LEFT, padx=10, pady=5)
-        self._title_prefix = tk.Label(title_frame, text="Tube: ", bg="#ddd",
+        self._title_prefix = tk.Label(title_frame, text="Bar: ", bg="#ddd",
                                        font=("Segoe UI", 12))
         self._title_prefix.pack(side=tk.LEFT)
-        self._title_tube_id = tk.Label(title_frame, text="", bg="#ddd",
+        self._title_bar_id = tk.Label(title_frame, text="", bg="#ddd",
                                         font=("Segoe UI", 12, "bold"))
-        self._title_tube_id.pack(side=tk.LEFT)
+        self._title_bar_id.pack(side=tk.LEFT)
         self._title_mid = tk.Label(title_frame, text="", bg="#ddd",
                                     font=("Segoe UI", 12))
         self._title_mid.pack(side=tk.LEFT)
@@ -492,7 +503,7 @@ class JigApp(tk.Tk):
         self._title_joint_id.pack(side=tk.LEFT)
 
         self.abandon_btn = tk.Button(
-            top_bar, text="✕ Abandon Tube", fg="red",
+            top_bar, text="✕ Abandon Bar", fg="red",
             font=("Segoe UI", 10), command=self._on_abandon,
         )
         self.abandon_btn.pack(side=tk.RIGHT, padx=10, pady=5)
@@ -745,15 +756,13 @@ class JigApp(tk.Tk):
             ji = d["joint_index"]
             jt = d["joint_total"]
             jid = d["joint_id"]
-            jtype = d["joint_type"]
+            jtype = d["joint_type"]         # concatenated key, e.g. "T20_Female"
+            jtype_display = d.get("joint_type_display", jtype)
             jori = d["joint_ori"]
 
-            # Update title: only tube ID and joint ID are bold
-            self._title_prefix.configure(text="Tube: ")
-            self._title_tube_id.configure(text=self._current_tube_id)
-            self._title_mid.configure(text=f"  —  Joint {ji+1}/{jt}  (")
-            self._title_joint_id.configure(text=jid)
-            # Close the parenthesis in a non-bold label after joint_id
+            # Update title: only bar ID and joint ID are bold
+            self._title_prefix.configure(text="Bar: ")
+            self._title_bar_id.configure(text=self._current_bar_id)
             self._title_mid.configure(
                 text=f"  —  Joint {ji+1}/{jt}  (")
             # We add the closing ')' by appending to joint_id for simplicity
@@ -798,11 +807,11 @@ class JigApp(tk.Tk):
                 self._rotation_target_deg = target_deg
 
             elif phase == "install":
-                jtype = d.get("joint_type", "")
+                jtype_display = d.get("joint_type_display", d.get("joint_type", ""))
                 jori = d.get("joint_ori", "")
                 self.instruction_var.set(
                     f"Install joint now:\n"
-                    f"Type: {jtype}   Orientation: {jori}\n\n"
+                    f"Type: {jtype_display}   Orientation: {jori}\n\n"
                     f"Press Confirm (or Enter) when installed."
                 )
                 self.confirm_btn.configure(state=tk.NORMAL,
@@ -869,10 +878,10 @@ class JigApp(tk.Tk):
 
         elif msg.kind == "done":
             abandoned = d.get("abandoned", False)
-            tube_ms = d.get("tube_time_ms", 0)
-            tid = d.get("tube_id", "")
+            bar_ms = d.get("bar_time_ms", 0)
+            bid = d.get("bar_id", "")
             # Show an in-wizard completion page instead of a popup
-            self._show_done_page(tid, tube_ms, abandoned)
+            self._show_done_page(bid, bar_ms, abandoned)
 
         elif msg.kind == "error":
             messagebox.showerror("Assembly Error",
@@ -880,10 +889,10 @@ class JigApp(tk.Tk):
             self._show_selection()
 
     # ─────────────────────────────────────────────────────────────
-    #  Tube done / abandoned page (replaces popup dialog)
+    #  Bar done / abandoned page (replaces popup dialog)
     # ─────────────────────────────────────────────────────────────
 
-    def _show_done_page(self, tube_id: str, tube_ms: int,
+    def _show_done_page(self, bar_id: str, bar_ms: int,
                         abandoned: bool) -> None:
         """Replace the assembly wizard content with a summary page
         and a 'Back to Selection' button — no modal dialog."""
@@ -900,15 +909,15 @@ class JigApp(tk.Tk):
         self.abandon_btn.configure(state=tk.DISABLED)
 
         # Title bar
-        self._title_prefix.configure(text="Tube: ")
-        self._title_tube_id.configure(text=tube_id)
+        self._title_prefix.configure(text="Bar: ")
+        self._title_bar_id.configure(text=bar_id)
         self._title_mid.configure(text="")
         self._title_joint_id.configure(text="")
 
-        duration = format_duration_ms(tube_ms)
+        duration = format_duration_ms(bar_ms)
         if abandoned:
             self.instruction_var.set(
-                f"Tube abandoned.\n\n"
+                f"Bar abandoned.\n\n"
                 f"Time elapsed: {duration}"
             )
             self.status_var.set("")
@@ -1009,13 +1018,13 @@ class JigApp(tk.Tk):
                 pass
 
     # ─────────────────────────────────────────────────────────────
-    #  Tube table: sorting
+    #  Bar table: sorting
     # ─────────────────────────────────────────────────────────────
 
     def _sort_tree(self, col: str) -> None:
         """Sort the Treeview by the given column (toggle asc/desc)."""
-        items = [(self.tube_tree.set(iid, col), iid)
-                 for iid in self.tube_tree.get_children("")]
+        items = [(self.bar_tree.set(iid, col), iid)
+                 for iid in self.bar_tree.get_children("")]
 
         try:
             items.sort(key=lambda t: float(t[0]))
@@ -1023,12 +1032,12 @@ class JigApp(tk.Tk):
             items.sort(key=lambda t: t[0])
 
         current = [iid for _, iid in items]
-        existing = list(self.tube_tree.get_children(""))
+        existing = list(self.bar_tree.get_children(""))
         if current == existing:
             items.reverse()
 
         for idx, (_, iid) in enumerate(items):
-            self.tube_tree.move(iid, "", idx)
+            self.bar_tree.move(iid, "", idx)
 
     # ─────────────────────────────────────────────────────────────
     #  Design file selection
@@ -1052,10 +1061,10 @@ class JigApp(tk.Tk):
         try:
             design = load_json(design_path)
             ensure_schema_version(design, expected=1)
-            tubes = design.get("tubes", [])
-            if not isinstance(tubes, list) or len(tubes) == 0:
+            bars = design.get("bars", [])
+            if not isinstance(bars, list) or len(bars) == 0:
                 messagebox.showerror("Error",
-                    "Design file contains no tubes[].")
+                    "Design file contains no bars[].")
                 return
         except Exception as e:
             messagebox.showerror("Error",
@@ -1064,7 +1073,7 @@ class JigApp(tk.Tk):
 
         self.design_path = design_path
         self.design = design
-        self.tubes = tubes
+        self.bars = bars
         self.log_path = design_log_path(design_path, self.raw_settings)
         self.offset_map = build_offset_map(self.raw_settings)
         self.design_file_var.set(design_path.name)
@@ -1072,58 +1081,60 @@ class JigApp(tk.Tk):
         set_last_design_dir(self.raw_settings, str(design_path.parent))
         save_settings(self.settings_path, self.raw_settings)
 
-        self._refresh_tube_table()
+        self._refresh_bar_table()
 
-    def _refresh_tube_table(self) -> None:
-        """Rebuild the tube Treeview from the current design + log."""
-        self.tube_tree.delete(*self.tube_tree.get_children())
+    def _refresh_bar_table(self) -> None:
+        """Rebuild the bar Treeview from the current design + log."""
+        self.bar_tree.delete(*self.bar_tree.get_children())
         self.detail_label.configure(text="")
         self.start_btn.configure(state=tk.DISABLED)
 
-        if not self.tubes or not self.log_path:
+        if not self.bars or not self.log_path:
             return
 
         events = parse_log_events(self.log_path)
-        cmap = get_tube_completion_map(events)
+        cmap = get_bar_completion_map(events)
 
-        for idx, tube in enumerate(self.tubes):
-            tid = tube.get("id", f"tube_{idx}")
-            length = tube.get("length", "?")
-            nj = len(tube.get("joints", []) or [])
-            info = cmap.get(str(tid))
+        for idx, bar in enumerate(self.bars):
+            bid = bar.get("bar_id", f"bar_{idx}")
+            length = bar.get("length_mm", "?")
+            nj = len(bar.get("joints", []) or [])
+            info = cmap.get(str(bid))
             if info:
                 ago = format_time_ago(info.completed_at)
-                dur = format_duration_ms(info.tube_time_ms)
+                dur = format_duration_ms(info.bar_time_ms)
                 status = f"{ago} ({dur})"
             else:
                 status = "—"
-            self.tube_tree.insert("", tk.END, iid=str(idx),
-                                   values=(tid, length, nj, status))
+            self.bar_tree.insert("", tk.END, iid=str(idx),
+                                   values=(bid, length, nj, status))
 
-    def _on_tube_select(self, event) -> None:
-        """Called when the user clicks a row in the tube table."""
-        sel = self.tube_tree.selection()
+    def _on_bar_select(self, event) -> None:
+        """Called when the user clicks a row in the bar table."""
+        sel = self.bar_tree.selection()
         if not sel:
             self.start_btn.configure(state=tk.DISABLED)
             self.detail_label.configure(text="")
             return
 
         idx = int(sel[0])
-        tube = self.tubes[idx]
-        tid = tube.get("id", f"tube_{idx}")
-        length = tube.get("length", "?")
-        joints = tube.get("joints", []) or []
+        bar = self.bars[idx]
+        bid = bar.get("bar_id", f"bar_{idx}")
+        length = bar.get("length_mm", "?")
+        joints = bar.get("joints", []) or []
 
-        lines = [f"Tube {tid}:  {length} mm,  {len(joints)} joint(s)\n"]
+        lines = [f"Bar {bid}:  {length} mm,  {len(joints)} joint(s)\n"]
         for j in sorted(joints,
                          key=lambda x: float(x.get("position_mm", 0))):
-            jid = j.get("id", "?")
-            jt = j.get("type", "?")
+            jid = j.get("joint_id", "?")
+            jt = j.get("type", "")
+            jst = j.get("subtype", "")
             jo = j.get("ori", "?")
             pos = j.get("position_mm", "?")
             rot = j.get("rotation_deg", "?")
+            type_display = f"{jt} {jst}".strip()
             lines.append(
-                f"  {jid:<8}  type={jt:<10}  ori={jo:<4}  "
+                f"  {jid:<8}  {type_display:<16}  ori={jo:<4}  "
                 f"pos={pos}mm  rot={rot}°"
             )
         self.detail_label.configure(text="\n".join(lines))
@@ -1139,7 +1150,7 @@ class JigApp(tk.Tk):
         """Switch the left panel to the selection screen."""
         self.assembly_frame.pack_forget()
         self.selection_frame.pack(fill=tk.BOTH, expand=True)
-        self._refresh_tube_table()
+        self._refresh_bar_table()
 
     def _show_assembly(self) -> None:
         """Switch the left panel to the assembly wizard screen."""
@@ -1155,7 +1166,7 @@ class JigApp(tk.Tk):
         self._current_photo = None
         self.image_label.configure(image="", text="")
         # Reset title labels
-        self._title_tube_id.configure(text="")
+        self._title_bar_id.configure(text="")
         self._title_mid.configure(text="")
         self._title_joint_id.configure(text="")
 
@@ -1165,21 +1176,21 @@ class JigApp(tk.Tk):
 
     def _on_start_assembly(self) -> None:
         """Validate, then switch to assembly screen and launch worker."""
-        sel = self.tube_tree.selection()
+        sel = self.bar_tree.selection()
         if not sel or self.hub is None:
             return
 
         idx = int(sel[0])
-        tube = self.tubes[idx]
-        tube_id = str(tube.get("id", f"tube_{idx}"))
+        bar = self.bars[idx]
+        bar_id = str(bar.get("bar_id", f"bar_{idx}"))
 
         try:
-            validate_offsets_complete(tube, self.offset_map)
+            validate_offsets_complete(bar, self.offset_map)
         except RuntimeError as e:
             messagebox.showerror("Missing Offsets", str(e))
             return
 
-        joints = list(tube.get("joints", []) or [])
+        joints = list(bar.get("joints", []) or [])
         joints.sort(key=lambda j: float(j.get("position_mm", 0.0)))
 
         # Reset control state
@@ -1188,20 +1199,20 @@ class JigApp(tk.Tk):
         self.confirm_install_event.clear()
         self.stall_retry_event.clear()
         self._confirm_action = None
-        self._current_tube_id = tube_id
+        self._current_bar_id = bar_id
         self._last_linear_error = 999.0
 
         self._show_assembly()
-        self._title_prefix.configure(text="Tube: ")
-        self._title_tube_id.configure(text=tube_id)
+        self._title_prefix.configure(text="Bar: ")
+        self._title_bar_id.configure(text=bar_id)
         self._title_mid.configure(text="  —  Starting...")
         self._title_joint_id.configure(text="")
 
         self.assembly_worker = AssemblyWorker(
             hub=self.hub,
             msg_queue=self.assembly_queue,
-            tube=tube,
-            tube_id=tube_id,
+            bar=bar,
+            bar_id=bar_id,
             joints=joints,
             offset_map=self.offset_map,
             cfg=self.cfg,
@@ -1246,8 +1257,8 @@ class JigApp(tk.Tk):
 
     def _on_abandon(self) -> None:
         """Signal the assembly worker to stop and return to selection."""
-        if messagebox.askyesno("Abandon Tube",
-                                "Are you sure you want to abandon this tube?"):
+        if messagebox.askyesno("Abandon Bar",
+                                "Are you sure you want to abandon this bar?"):
             self.abandon_event.set()
             self.confirm_linear_event.set()
             self.confirm_install_event.set()

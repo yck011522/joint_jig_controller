@@ -1,0 +1,170 @@
+{
+  "schema_version": 1,
+  "project_id": "Example3",
+  "bars": [
+    {
+      "bar_id": "B1",
+      "length_mm": 500.0,
+      "joints": [
+        {
+          "joint_id": "J1-2",
+          "type": "T20",
+          "subtype": "Female",
+          "ori": "N",
+          "position_mm": 73.97,
+          "rotation_deg": -90.0
+        },
+        {
+          "joint_id": "J1-4",
+          "type": "T20",
+          "subtype": "Female",
+          "ori": "P",
+          "position_mm": 187.79,
+          "rotation_deg": -22.14
+        },
+        {
+          "joint_id": "J1-6",
+          "type": "T20",
+          "subtype": "Female",
+          "ori": "N",
+          "position_mm": 244.48,
+          "rotation_deg": 109.96
+        },
+        {
+          "joint_id": "J1-3",
+          "type": "T20",
+          "subtype": "Female",
+          "ori": "P",
+          "position_mm": 437.0,
+          "rotation_deg": 180.0
+        }
+      ]
+    },
+    {
+      "bar_id": "B2",
+      "length_mm": 500.0,
+      "joints": [
+        {
+          "joint_id": "J1-2",
+          "type": "T20",
+          "subtype": "Male",
+          "ori": "P",
+          "position_mm": 88.48,
+          "rotation_deg": -90.0
+        },
+        {
+          "joint_id": "J2-6",
+          "type": "T20",
+          "subtype": "Female",
+          "ori": "N",
+          "position_mm": 232.82,
+          "rotation_deg": 106.72
+        },
+        {
+          "joint_id": "J2-5",
+          "type": "T20",
+          "subtype": "Female",
+          "ori": "P",
+          "position_mm": 353.9,
+          "rotation_deg": -128.79
+        }
+      ]
+    },
+    {
+      "bar_id": "B3",
+      "length_mm": 500.0,
+      "joints": [
+        {
+          "joint_id": "J1-3",
+          "type": "T20",
+          "subtype": "Male",
+          "ori": "P",
+          "position_mm": 125.0,
+          "rotation_deg": 90.0
+        },
+        {
+          "joint_id": "J3-4",
+          "type": "T20",
+          "subtype": "Female",
+          "ori": "P",
+          "position_mm": 255.88,
+          "rotation_deg": -78.28
+        },
+        {
+          "joint_id": "J3-5",
+          "type": "T20",
+          "subtype": "Female",
+          "ori": "N",
+          "position_mm": 311.91,
+          "rotation_deg": -137.97
+        }
+      ]
+    },
+    {
+      "bar_id": "B4",
+      "length_mm": 500.0,
+      "joints": [
+        {
+          "joint_id": "J3-4",
+          "type": "T20",
+          "subtype": "Male",
+          "ori": "N",
+          "position_mm": 141.24,
+          "rotation_deg": 180.0
+        },
+        {
+          "joint_id": "J1-4",
+          "type": "T20",
+          "subtype": "Male",
+          "ori": "N",
+          "position_mm": 398.28,
+          "rotation_deg": -155.08
+        }
+      ]
+    },
+    {
+      "bar_id": "B5",
+      "length_mm": 500.0,
+      "joints": [
+        {
+          "joint_id": "J3-5",
+          "type": "T20",
+          "subtype": "Male",
+          "ori": "P",
+          "position_mm": 145.22,
+          "rotation_deg": 180.0
+        },
+        {
+          "joint_id": "J2-5",
+          "type": "T20",
+          "subtype": "Male",
+          "ori": "N",
+          "position_mm": 380.07,
+          "rotation_deg": -91.86
+        }
+      ]
+    },
+    {
+      "bar_id": "B6",
+      "length_mm": 500.0,
+      "joints": [
+        {
+          "joint_id": "J2-6",
+          "type": "T20",
+          "subtype": "Male",
+          "ori": "P",
+          "position_mm": 192.6,
+          "rotation_deg": 87.24
+        },
+        {
+          "joint_id": "J1-6",
+          "type": "T20",
+          "subtype": "Male",
+          "ori": "P",
+          "position_mm": 292.25,
+          "rotation_deg": 101.4
+        }
+      ]
+    }
+  ]
+}

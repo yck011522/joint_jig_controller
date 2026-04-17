@@ -1,11 +1,11 @@
-# Tube Joint Placement Jig  
+# Bar Joint Placement Jig  
 *A semi-automated 2-DoF human–machine cooperative assembly system*
 
 ---
 
 # 1. Overview
 
-This project is a semi-automated mechanical jig designed to assist an operator in placing 3D-printed joints onto a metal tube with controlled:
+This project is a semi-automated mechanical jig designed to assist an operator in placing 3D-printed joints onto a metal bar with controlled:
 
 - **Axial position (Joint 1)**
 - **Rotational orientation (Joint 2)**
@@ -96,9 +96,9 @@ Therefore, achievable rotational accuracy is expected to be limited by mechanica
 
 ## 3.1 Setup Phase
 
-1. Operator loads metal tube.
-2. Tube length verified against design specification.
-3. Tube clamped in motor chuck.
+1. Operator loads metal bar.
+2. Bar length verified against design specification.
+3. Bar clamped in motor chuck.
 4. Stepper rotation set to zero reference.
 5. Operator confirms installation.
 
@@ -174,8 +174,8 @@ Operator unlocks carriage and proceeds to next joint.
 
 System displays:
 
-- Tube complete message
-- Tube ID
+- Bar complete message
+- Bar ID
 
 Future extension: automatic label printing  
 Current method: manual labeling
@@ -230,13 +230,13 @@ Tube designs are authored in Rhino/Grasshopper.
 
 Exported JSON describes:
 
-- Multiple tubes
-- Tube length
+- Multiple bars
+- Bar length
 - Ordered joint list
-- Joint type
+- Joint type and subtype
 - Axial position (mm)
 - Rotation angle (deg)
-- Orientation variant
+- Orientation variant (P/N)
 
 JSON acts as interface between design and production.
 
@@ -250,15 +250,16 @@ Design files follow schema v1 (see [json_schema.md](json_schema.md) for full spe
 {
   "schema_version": 1,
   "project_id": "Batch_2026_04",
-  "tubes": [
+  "bars": [
     {
-      "id": "T1",
-      "length": 1000,
+      "bar_id": "B1",
+      "length_mm": 1000,
       "joints": [
         {
-          "id": "J001",
-          "type": "T20-5-M",
-          "ori": "L",
+          "joint_id": "J1",
+          "type": "T20",
+          "subtype": "Female",
+          "ori": "P",
           "position_mm": 120.0,
           "rotation_deg": 45.0
         }
@@ -324,15 +325,15 @@ Logged per joint:
 - Split-panel layout: operator assembly wizard (left) + engineer panel (right)
 - Joint reference images displayed during each installation step
 - Rotation progress bar during motor movement
-- Tube completion status table with time-ago display
+- Bar completion status table with time-ago display
 - Stall detection with retry prompt
 - Automatic reconnect button when the USB adapter is unplugged
 
 ### CLI features
 
 - Interactive terminal workflow with live sensor readout
-- Design file selection with tube completion status
-- Abandon tube support
+- Design file selection with bar completion status
+- Abandon bar support
 
 ### Reconnect behaviour
 
@@ -356,7 +357,7 @@ Data logging transforms manual fabrication into measurable production.
 # 10. Future Extensions
 
 - Automatic label printer
-- Statistics & analytics module (per-tube metrics, operator trends, build-time prediction)
+- Statistics & analytics module (per-bar metrics, operator trends, build-time prediction)
 - Multi-operator analytics
 - Time prediction model
 - Real-time graphical tolerance visualization

@@ -31,27 +31,27 @@
     },
     "linear": {
         "linear_tol_mm": 2.0,
-        "sensor_global_offset_mm": 0.0,
+        "sensor_global_offset_mm": -90.3,
         "joint_offsets": [
             {
-                "type": "T20-5-M",
-                "ori": "L",
-                "offset_mm": 0.0
+                "type": "T20_Male",
+                "ori": "P",
+                "offset_mm": 25.0
             },
             {
-                "type": "T20-5-M",
-                "ori": "R",
-                "offset_mm": 0.0
+                "type": "T20_Male",
+                "ori": "N",
+                "offset_mm": 25.0
             },
             {
-                "type": "T20-5-F",
-                "ori": "L",
-                "offset_mm": 0.0
+                "type": "T20_Female",
+                "ori": "P",
+                "offset_mm": 30.0
             },
             {
-                "type": "T20-5-F",
-                "ori": "R",
-                "offset_mm": 0.0
+                "type": "T20_Female",
+                "ori": "N",
+                "offset_mm": 10.0
             }
         ]
     },
@@ -59,24 +59,24 @@
         "base_dir": "images",
         "joint_images": [
             {
-                "type": "T20-5-M",
-                "ori": "L",
-                "rel_path": "T20-5-M_L.jpg"
+                "type": "T20_Male",
+                "ori": "P",
+                "rel_path": "T20_Male_P.jpg"
             },
             {
-                "type": "T20-5-M",
-                "ori": "R",
-                "rel_path": "T20-5-M_R.jpg"
+                "type": "T20_Male",
+                "ori": "N",
+                "rel_path": "T20_Male_N.jpg"
             },
             {
-                "type": "T20-5-F",
-                "ori": "L",
-                "rel_path": "T20-5-F_L.jpg"
+                "type": "T20_Female",
+                "ori": "P",
+                "rel_path": "T20_Female_P.jpg"
             },
             {
-                "type": "T20-5-F",
-                "ori": "R",
-                "rel_path": "T20-5-F_R.jpg"
+                "type": "T20_Female",
+                "ori": "N",
+                "rel_path": "T20_Female_N.jpg"
             }
         ]
     },

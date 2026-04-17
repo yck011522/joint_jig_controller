@@ -8,9 +8,9 @@ validation live in jig_controller.py so that a future GUI can reuse them.
 The CLI adds only:
   - Console text output / ``print()``
   - Non-blocking Enter detection (msvcrt on Windows)
-  - Interactive prompts for design-file and tube selection
-  - The main while-loop that drives the tube → joint → install workflow
-  - Tube abandonment support (type 'a' at any step)
+  - Interactive prompts for design-file and bar selection
+  - The main while-loop that drives the bar → joint → install workflow
+  - Bar abandonment support (type 'a' at any step)
 """
 
 from __future__ import annotations
@@ -20,17 +20,17 @@ from pathlib import Path
 from typing import Optional
 
 from jig_controller import (
+    EVENT_BAR_ABANDONED,
+    EVENT_BAR_INSTALL_COMPLETE,
+    EVENT_BAR_START,
     EVENT_INSTALL_CONFIRM,
     EVENT_LINEAR_CONFIRM,
     EVENT_ROTATION_REACHED,
     EVENT_STALL_DETECTED,
-    EVENT_TUBE_ABANDONED,
-    EVENT_TUBE_INSTALL_COMPLETE,
-    EVENT_TUBE_START,
+    BarCompletionInfo,
     JigSettings,
     HardwareContext,
     RotationResult,
-    TubeCompletionInfo,
     append_event,
     build_offset_map,
     connect_hardware,
@@ -38,8 +38,9 @@ from jig_controller import (
     ensure_schema_version,
     format_duration_ms,
     format_time_ago,
+    get_bar_completion_map,
     get_last_design_dir,
-    get_tube_completion_map,
+    joint_type_key,
     load_json,
     now_iso_local,
     parse_log_events,
@@ -182,7 +183,7 @@ def main() -> None:
     hw: HardwareContext = connect_hardware(cfg)
 
     # ── Outer loop: design-file selection ────────────────────────
-    tubes_completed = 0
+    bars_completed = 0
 
     try:
         while True:
@@ -195,9 +196,9 @@ def main() -> None:
             design = load_json(design_path)
             ensure_schema_version(design, expected=1)
 
-            tubes = design.get("tubes", [])
-            if not isinstance(tubes, list) or len(tubes) == 0:
-                print("[error] Design file contains no tubes[]. Try another file.")
+            bars = design.get("bars", [])
+            if not isinstance(bars, list) or len(bars) == 0:
+                print("[error] Design file contains no bars[]. Try another file.")
                 continue
 
             # Remember this directory for next time
@@ -208,31 +209,31 @@ def main() -> None:
             offset_map = build_offset_map(raw_settings)
             log_path = design_log_path(design_path, raw_settings)
 
-            print(f"\nDesign loaded: {design_path.name}  ({len(tubes)} tube(s))")
+            print(f"\nDesign loaded: {design_path.name}  ({len(bars)} bar(s))")
             print(f"Log file: {log_path}")
 
-            # ── 5) Tube selection loop ───────────────────────────
+            # ── 5) Bar selection loop ────────────────────────────
             while True:
-                # Parse log to get completion status for each tube
+                # Parse log to get completion status for each bar
                 log_events = parse_log_events(log_path)
-                completion_map = get_tube_completion_map(log_events)
+                completion_map = get_bar_completion_map(log_events)
 
                 print("\n" + "=" * 60)
-                print("  TUBE SELECTION")
+                print("  BAR SELECTION")
                 print("=" * 60)
                 print(f"  {'#':>3}  {'ID':<10} {'Length':>8} {'Joints':>7}  {'Last Assembled'}")
                 print(f"  {'─'*3}  {'─'*10} {'─'*8} {'─'*7}  {'─'*30}")
 
-                for idx, tube_entry in enumerate(tubes):
-                    display_id = tube_entry.get("id", f"tube_{idx}")
-                    length = tube_entry.get("length", "?")
-                    num_joints = len(tube_entry.get("joints", []) or [])
+                for idx, bar_entry in enumerate(bars):
+                    display_id = bar_entry.get("bar_id", f"bar_{idx}")
+                    length = bar_entry.get("length_mm", "?")
+                    num_joints = len(bar_entry.get("joints", []) or [])
 
                     # Check completion status from log
                     info = completion_map.get(str(display_id))
                     if info:
                         ago = format_time_ago(info.completed_at)
-                        dur = format_duration_ms(info.tube_time_ms)
+                        dur = format_duration_ms(info.bar_time_ms)
                         status_str = f"{ago} ({dur})"
                     else:
                         status_str = "—"
@@ -241,75 +242,79 @@ def main() -> None:
 
                 print(f"\n  Type 'q' to choose a different design file.")
                 selected_index = prompt_choice(
-                    "Select tube index: ",
-                    range(len(tubes)),
+                    "Select bar index: ",
+                    range(len(bars)),
                 )
                 if selected_index is None:
                     # Go back to design file selection
                     break
 
-                tube = tubes[selected_index]
+                bar = bars[selected_index]
 
                 # Validate that all joint types/orientations have offsets
                 try:
-                    validate_offsets_complete(tube, offset_map)
+                    validate_offsets_complete(bar, offset_map)
                 except RuntimeError as e:
                     print(f"\n[error] {e}")
-                    print("Skipping this tube. Fix offsets in settings.json and try again.")
+                    print("Skipping this bar. Fix offsets in settings.json and try again.")
                     continue
 
-                tube_id = str(tube.get("id", f"tube_{selected_index}"))
-                tube_length = float(tube.get("length", 0.0))
-                joints = list(tube.get("joints", []) or [])
+                bar_id = str(bar.get("bar_id", f"bar_{selected_index}"))
+                bar_length = float(bar.get("length_mm", 0.0))
+                joints = list(bar.get("joints", []) or [])
                 joints.sort(key=lambda j: float(j.get("position_mm", 0.0)))
 
-                print(f"\n--- Initiating Tube: {tube_id}  length={tube_length}mm  joints={len(joints)} ---")
+                print(f"\n--- Initiating Bar: {bar_id}  length={bar_length}mm  joints={len(joints)} ---")
                 print(f"Log will be saved to:  {log_path}")
-                print("Type 'a' at any prompt to abandon this tube.\n")
-                raw = input("Mount tube, then press Enter to START ... ").strip().lower()
+                print("Type 'a' at any prompt to abandon this bar.\n")
+                raw = input("Mount bar, then press Enter to START ... ").strip().lower()
                 if raw in ("a", "abandon"):
-                    print("[abandon] Tube not started.")
+                    print("[abandon] Bar not started.")
                     continue
 
-                # ── Begin tube assembly ──────────────────────────
-                tube_start_time = time.perf_counter()
+                # ── Begin bar assembly ───────────────────────────
+                bar_start_time = time.perf_counter()
                 hw.motor.zero_here()
                 abandoned = False
 
                 append_event(log_path, {
                     "ts": now_iso_local(),
-                    "event": EVENT_TUBE_START,
+                    "event": EVENT_BAR_START,
                     "design_file": design_path.name,
-                    "tube_id": tube_id,
-                    "tube_length_mm": tube_length,
+                    "bar_id": bar_id,
+                    "bar_length_mm": bar_length,
                     "num_joints": len(joints),
                 })
 
                 for joint_index, joint_entry in enumerate(joints):
-                    joint_id = str(joint_entry.get("id", f"joint_{joint_index}"))
-                    joint_type = str(joint_entry.get("type", "")).strip()
+                    joint_id = str(joint_entry.get("joint_id", f"joint_{joint_index}"))
+                    jt_key = joint_type_key(joint_entry)  # e.g. "T20_Female"
+                    joint_type_raw = str(joint_entry.get("type", "")).strip()
+                    joint_subtype = str(joint_entry.get("subtype", "")).strip()
                     joint_ori = str(joint_entry.get("ori", "")).strip()
                     position_mm = float(joint_entry.get("position_mm", 0.0))
                     rotation_deg = float(joint_entry.get("rotation_deg", 0.0))
 
-                    joint_offset = offset_map[(joint_type, joint_ori)]
-                    target_mm = position_mm + cfg.linear.sensor_global_offset_mm + joint_offset
+                    joint_offset = offset_map[(jt_key, joint_ori)]
+                    target_mm = position_mm - joint_offset
+
+                    type_display = f"{joint_type_raw} {joint_subtype}".strip()
 
                     print("\n" + "-" * 60)
                     print(
                         f"Prepare Joint {joint_id} ({joint_index+1} of {len(joints)})"
-                        f" | type={joint_type} ori={joint_ori}"
+                        f" | type={type_display} ori={joint_ori}"
                     )
                     print(
                         f"-  Distance Target: position_mm={position_mm:.1f}mm  -> "
-                        f"target_mm={target_mm:.1f}mm (global+joint offsets applied)"
+                        f"target_mm={target_mm:.1f}mm (joint offset {joint_offset:.1f}mm subtracted)"
                     )
                     print(f"-  Rotation Target: rotation_deg={rotation_deg:.1f}°")
 
                     # ── LINEAR POSITIONING ───────────────────────
                     linear_start_time = time.perf_counter()
                     print("\nMove carriage to target. Press ENTER to confirm (Rotation will then begin)")
-                    print("Type 'a' to abandon this tube.\n")
+                    print("Type 'a' to abandon this bar.\n")
 
                     linear_confirmed = False
                     while True:
@@ -343,9 +348,10 @@ def main() -> None:
                                     "ts": now_iso_local(),
                                     "event": EVENT_LINEAR_CONFIRM,
                                     "design_file": design_path.name,
-                                    "tube_id": tube_id,
+                                    "bar_id": bar_id,
                                     "joint_id": joint_id,
-                                    "joint_type": joint_type,
+                                    "joint_type": joint_type_raw,
+                                    "joint_subtype": joint_subtype,
                                     "ori": joint_ori,
                                     "joint_seq": joint_index,
                                     "target_mm": target_mm,
@@ -397,9 +403,10 @@ def main() -> None:
                             "ts": now_iso_local(),
                             "event": EVENT_STALL_DETECTED,
                             "design_file": design_path.name,
-                            "tube_id": tube_id,
+                            "bar_id": bar_id,
                             "joint_id": joint_id,
-                            "joint_type": joint_type,
+                            "joint_type": joint_type_raw,
+                            "joint_subtype": joint_subtype,
                             "ori": joint_ori,
                             "joint_seq": joint_index,
                             "target_deg": target,
@@ -430,9 +437,10 @@ def main() -> None:
                         "ts": now_iso_local(),
                         "event": EVENT_ROTATION_REACHED,
                         "design_file": design_path.name,
-                        "tube_id": tube_id,
+                        "bar_id": bar_id,
                         "joint_id": joint_id,
-                        "joint_type": joint_type,
+                        "joint_type": joint_type_raw,
+                        "joint_subtype": joint_subtype,
                         "ori": joint_ori,
                         "joint_seq": joint_index,
                         "target_deg": rotation_deg,
@@ -446,7 +454,7 @@ def main() -> None:
 
                     # ── INSTALL JOINT ────────────────────────────
                     print(
-                        f"\nInstall joint now: type={joint_type} ori={joint_ori}. "
+                        f"\nInstall joint now: type={type_display} ori={joint_ori}. "
                         f"Press ENTER when installed (or 'a' to abandon)."
                     )
                     install_start_time = time.perf_counter()
@@ -463,27 +471,28 @@ def main() -> None:
                         "ts": now_iso_local(),
                         "event": EVENT_INSTALL_CONFIRM,
                         "design_file": design_path.name,
-                        "tube_id": tube_id,
+                        "bar_id": bar_id,
                         "joint_id": joint_id,
-                        "joint_type": joint_type,
+                        "joint_type": joint_type_raw,
+                        "joint_subtype": joint_subtype,
                         "ori": joint_ori,
                         "joint_seq": joint_index,
                         "install_time_ms": install_time_ms,
                     })
 
                 # ── After joint loop: complete or abandoned ──────
-                total_tube_time_ms = int(
-                    (time.perf_counter() - tube_start_time) * 1000
+                total_bar_time_ms = int(
+                    (time.perf_counter() - bar_start_time) * 1000
                 )
 
                 if abandoned:
-                    print(f"\n[abandon] Tube {tube_id} abandoned.")
+                    print(f"\n[abandon] Bar {bar_id} abandoned.")
                     append_event(log_path, {
                         "ts": now_iso_local(),
-                        "event": EVENT_TUBE_ABANDONED,
+                        "event": EVENT_BAR_ABANDONED,
                         "design_file": design_path.name,
-                        "tube_id": tube_id,
-                        "tube_time_ms": total_tube_time_ms,
+                        "bar_id": bar_id,
+                        "bar_time_ms": total_bar_time_ms,
                         "joints_completed": joint_index,
                         "joints_total": len(joints),
                     })
@@ -491,26 +500,26 @@ def main() -> None:
                     # All joints installed successfully
                     append_event(log_path, {
                         "ts": now_iso_local(),
-                        "event": EVENT_TUBE_INSTALL_COMPLETE,
+                        "event": EVENT_BAR_INSTALL_COMPLETE,
                         "design_file": design_path.name,
-                        "tube_id": tube_id,
-                        "tube_time_ms": total_tube_time_ms,
+                        "bar_id": bar_id,
+                        "bar_time_ms": total_bar_time_ms,
                     })
-                    tubes_completed += 1
+                    bars_completed += 1
                     print("\n" + "=" * 60)
                     print(
-                        f"Tube complete: {tube_id} | "
-                        f"time = {total_tube_time_ms/1000:.1f}s | "
-                        f"session total = {tubes_completed} tube(s)"
+                        f"Bar complete: {bar_id} | "
+                        f"time = {total_bar_time_ms/1000:.1f}s | "
+                        f"session total = {bars_completed} bar(s)"
                     )
                     print(f"Log written to: {log_path}")
-                # Loop back to tube selection
+                # Loop back to bar selection
 
     except KeyboardInterrupt:
         print("\n\n[abort] Interrupted by operator (Ctrl+C).")
 
     finally:
-        print(f"\nSession summary: {tubes_completed} tube(s) completed.")
+        print(f"\nSession summary: {bars_completed} bar(s) completed.")
         hw.close()
         print("[exit] Serial port closed.")
 

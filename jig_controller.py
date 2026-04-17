@@ -13,7 +13,7 @@ Key responsibilities:
   - Provide a rotate-with-stall-detection routine that handles retries.
   - Logging helpers (JSONL event append, ISO timestamp).
   - Design file validation (schema, offset completeness).
-  - Log parsing: read past events to determine tube completion status.
+  - Log parsing: read past events to determine bar completion status.
 """
 
 from __future__ import annotations
@@ -37,13 +37,13 @@ from motor_comm import MotorCommError, ZDTEmmMotor, MotorKinematics
 #  Event name constants — used in both log writing and parsing
 # ═══════════════════════════════════════════════════════════════
 
-EVENT_TUBE_START = "tube_start"
+EVENT_BAR_START = "bar_start"
 EVENT_LINEAR_CONFIRM = "linear_confirm"
 EVENT_ROTATION_REACHED = "rotation_reached"
 EVENT_STALL_DETECTED = "stall_detected"
 EVENT_INSTALL_CONFIRM = "install_confirm"
-EVENT_TUBE_INSTALL_COMPLETE = "tube_install_complete"
-EVENT_TUBE_ABANDONED = "tube_abandoned"
+EVENT_BAR_INSTALL_COMPLETE = "bar_install_complete"
+EVENT_BAR_ABANDONED = "bar_abandoned"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -118,34 +118,41 @@ def parse_log_events(log_path: Path) -> List[dict]:
 
 
 @dataclass
-class TubeCompletionInfo:
-    """Summary of the most recent successful assembly of one tube."""
-    tube_id: str
+class BarCompletionInfo:
+    """Summary of the most recent successful assembly of one bar."""
+    bar_id: str
     completed_at: str          # ISO timestamp string
-    tube_time_ms: int          # total assembly time in ms
+    bar_time_ms: int           # total assembly time in ms
 
 
-def get_tube_completion_map(
+def get_bar_completion_map(
     events: List[dict],
-) -> Dict[str, TubeCompletionInfo]:
-    """Scan log events and return the *last* completion record per tube_id.
+) -> Dict[str, BarCompletionInfo]:
+    """Scan log events and return the *last* completion record per bar_id.
 
-    Looks for both the old ``"tube_complete"`` event name and the new
-    ``"tube_install_complete"`` name so that existing logs still work.
+    Accepts legacy event names (``"tube_complete"``,
+    ``"tube_install_complete"``) as well as the current
+    ``"bar_install_complete"`` so that existing logs still work.
     """
-    completion_map: Dict[str, TubeCompletionInfo] = {}
+    _COMPLETE_EVENTS = (
+        EVENT_BAR_INSTALL_COMPLETE,
+        "tube_install_complete",
+        "tube_complete",
+    )
+    completion_map: Dict[str, BarCompletionInfo] = {}
     for ev in events:
         event_type = ev.get("event", "")
-        # Accept both old and new event names
-        if event_type not in (EVENT_TUBE_INSTALL_COMPLETE, "tube_complete"):
+        if event_type not in _COMPLETE_EVENTS:
             continue
-        tube_id = ev.get("tube_id", "")
-        if not tube_id:
+        # Accept both new "bar_id" and legacy "tube_id"
+        bar_id = ev.get("bar_id", "") or ev.get("tube_id", "")
+        if not bar_id:
             continue
-        completion_map[tube_id] = TubeCompletionInfo(
-            tube_id=tube_id,
+        time_ms = int(ev.get("bar_time_ms", 0) or ev.get("tube_time_ms", 0))
+        completion_map[bar_id] = BarCompletionInfo(
+            bar_id=bar_id,
             completed_at=ev.get("ts", ""),
-            tube_time_ms=int(ev.get("tube_time_ms", 0)),
+            bar_time_ms=time_ms,
         )
     return completion_map
 
@@ -255,23 +262,33 @@ def build_offset_map(settings: dict) -> Dict[Tuple[str, str], float]:
     return offset_map
 
 
-def required_type_ori_pairs(tube: dict) -> set[Tuple[str, str]]:
-    """Return the set of (type, orientation) pairs needed by *tube*."""
+def joint_type_key(joint: dict) -> str:
+    """Build the concatenated type key from a joint's type + subtype.
+
+    E.g. type="T20", subtype="Female" → ``"T20_Female"``.
+    """
+    t = str(joint.get("type", "")).strip()
+    st = str(joint.get("subtype", "")).strip()
+    return f"{t}_{st}" if st else t
+
+
+def required_type_ori_pairs(bar: dict) -> set[Tuple[str, str]]:
+    """Return the set of (type_key, orientation) pairs needed by *bar*."""
     pairs: set[Tuple[str, str]] = set()
-    for joint in tube.get("joints", []) or []:
-        t = str(joint.get("type", "")).strip()
+    for joint in bar.get("joints", []) or []:
+        key = joint_type_key(joint)
         o = str(joint.get("ori", "")).strip()
-        if t and o:
-            pairs.add((t, o))
+        if key and o:
+            pairs.add((key, o))
     return pairs
 
 
 def validate_offsets_complete(
-    tube: dict, offset_map: Dict[Tuple[str, str], float]
+    bar: dict, offset_map: Dict[Tuple[str, str], float]
 ) -> None:
-    """Raise ``RuntimeError`` if *tube* references joints without an offset."""
+    """Raise ``RuntimeError`` if *bar* references joints without an offset."""
     missing = sorted(
-        p for p in required_type_ori_pairs(tube) if p not in offset_map
+        p for p in required_type_ori_pairs(bar) if p not in offset_map
     )
     if missing:
         msg = "Missing joint_offsets entries for (type, ori):\n" + "\n".join(
