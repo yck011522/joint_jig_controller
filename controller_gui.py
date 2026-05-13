@@ -41,6 +41,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import label_printer
 from jig_controller import (
     EVENT_BAR_ABANDONED,
     EVENT_BAR_INSTALL_COMPLETE,
@@ -82,6 +83,7 @@ from jig_controller import (
 
 POLL_INTERVAL_S = 1 / 30    # HardwareHub background poll interval (~30 Hz)
 GUI_DRAIN_MS = 100          # how often the GUI drains the message queue
+LABEL_PRINTER_POLL_MS = 2000  # how often to re-check label-printer USB presence
 WINDOW_TITLE = "Joint Jig Controller"
 WINDOW_MIN_SIZE = (1100, 700)
 
@@ -396,6 +398,16 @@ class JigApp(tk.Tk):
         # Latest linear error for tolerance check
         self._last_linear_error: float = 999.0
 
+        # Label-printer state
+        self._label_printer_present: bool = False
+        self._label_print_in_progress: bool = False
+        self._selection_label_print_in_progress: bool = False
+        # Cached info about the bar currently being assembled, captured
+        # at start so we can print a label after completion.
+        self._current_bar_id: str = ""
+        self._current_bar_seq: int = 0
+        self._current_bar_length_mm: float = 0.0
+
         # ── Layout ───────────────────────────────────────────────
         self._build_ui()
 
@@ -467,14 +479,26 @@ class JigApp(tk.Tk):
         )
         self.detail_label.pack(fill=tk.X, padx=10, pady=(0, 5))
 
-        # Start Assembly button
+        # Primary selection-screen actions
+        action_row = tk.Frame(self.selection_frame, bg="#f0f0f0")
+        action_row.pack(pady=(5, 10))
+
         self.start_btn = tk.Button(
-            self.selection_frame, text="\u25b6  Start Assembly",
+            action_row, text="\u25b6  Start Assembly",
             font=("Segoe UI", 12, "bold"), state=tk.DISABLED,
             command=self._on_start_assembly, bg="#4CAF50", fg="white",
             activebackground="#45a049", padx=20, pady=8,
         )
-        self.start_btn.pack(pady=(5, 10))
+        self.start_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.print_label_btn = tk.Button(
+            action_row, text="Print Label",
+            font=("Segoe UI", 11), state=tk.DISABLED,
+            command=self._on_print_label_from_selection,
+            bg="#1976D2", fg="white", activebackground="#1565C0",
+            padx=16, pady=8,
+        )
+        self.print_label_btn.pack(side=tk.LEFT)
 
         # Show selection by default
         self.selection_frame.pack(fill=tk.BOTH, expand=True)
@@ -609,6 +633,15 @@ class JigApp(tk.Tk):
         tk.Label(self.right_panel, textvariable=self.eng_motion_var,
                  bg="#e8e8e8", font=("Consolas", 9)).pack(anchor=tk.W, padx=10)
 
+        # Label-printer status (auto-detected over USB)
+        self._add_eng_label("Label Printer")
+        self.eng_label_printer_var = tk.StringVar(value="Detecting...")
+        self.eng_label_printer_lbl = tk.Label(
+            self.right_panel, textvariable=self.eng_label_printer_var,
+            bg="#e8e8e8", font=("Consolas", 9), fg="#555",
+        )
+        self.eng_label_printer_lbl.pack(anchor=tk.W, padx=10)
+
     def _add_eng_label(self, text: str) -> None:
         """Add a small section header in the engineer panel."""
         tk.Label(self.right_panel, text=text, bg="#e8e8e8",
@@ -661,6 +694,9 @@ class JigApp(tk.Tk):
 
         # Start the GUI refresh loop (reads from hub + drains queues)
         self.after(GUI_DRAIN_MS, self._gui_tick)
+
+        # Start the label-printer USB presence poller (hot-plug)
+        self.after(200, self._label_printer_tick)
 
     # ─────────────────────────────────────────────────────────────
     #  Reconnect
@@ -744,6 +780,43 @@ class JigApp(tk.Tk):
                 break
 
         self.after(GUI_DRAIN_MS, self._gui_tick)
+
+    # ─────────────────────────────────────────────────────────────
+    #  Label-printer hot-plug detection
+    # ─────────────────────────────────────────────────────────────
+
+    def _label_printer_tick(self) -> None:
+        """Periodically check whether the Brother label printer is on USB.
+
+        Runs even while a print job is in progress — only updates the
+        engineer-panel label and an internal flag; the done-page status
+        text is refreshed from this flag the next time it is shown.
+        """
+        if not label_printer.is_dependencies_available():
+            self._label_printer_present = False
+            err = label_printer.import_error_message() or "unavailable"
+            short = err.split(":")[0]
+            self.eng_label_printer_var.set(f"DISABLED ({short})")
+            self.eng_label_printer_lbl.configure(fg="#888")
+        else:
+            present = label_printer.is_printer_present()
+            if present != self._label_printer_present:
+                self._label_printer_present = present
+                # If the done page is currently showing the "printer
+                # missing" state and the printer just appeared, refresh.
+                if (getattr(self, "_confirm_action", None) ==
+                        "label_print"):
+                    self._refresh_label_status_text()
+            if present:
+                self.eng_label_printer_var.set("Connected (Brother PT)")
+                self.eng_label_printer_lbl.configure(fg="#2e7d32")
+            else:
+                self.eng_label_printer_var.set("Not detected")
+                self.eng_label_printer_lbl.configure(fg="#b71c1c")
+
+        self._update_selection_action_buttons()
+
+        self.after(LABEL_PRINTER_POLL_MS, self._label_printer_tick)
 
     # ─────────────────────────────────────────────────────────────
     #  Assembly message handler
@@ -894,8 +967,14 @@ class JigApp(tk.Tk):
 
     def _show_done_page(self, bar_id: str, bar_ms: int,
                         abandoned: bool) -> None:
-        """Replace the assembly wizard content with a summary page
-        and a 'Back to Selection' button — no modal dialog."""
+        """Replace the assembly wizard content with a summary page.
+
+        On a successful (non-abandoned) bar, show the label-printing
+        sub-step: pressing Enter prints the label, ``Skip`` continues to
+        the selection screen, and any printer error / missing-device
+        condition is reported inline so the user can retry after
+        plugging in the device.
+        """
 
         # Hide all variable assembly widgets
         self.image_label.configure(image="", text="")
@@ -921,19 +1000,157 @@ class JigApp(tk.Tk):
                 f"Time elapsed: {duration}"
             )
             self.status_var.set("")
-        else:
-            self.instruction_var.set(
-                f"✓  Assembly complete!\n\n"
-                f"Total time: {duration}"
+            # Just a back button — no label printing for abandoned bars.
+            self.confirm_btn.configure(
+                state=tk.NORMAL, text="Back to Selection",
+                bg="#607D8B", activebackground="#546E7A",
             )
-            self.status_var.set("")
+            self._confirm_action = "back_to_selection"
+            self._hide_skip_label_btn()
+            return
 
-        # Re-label the confirm button as "Back to Selection"
+        # Bar completed successfully — offer label printing as a step.
+        self.instruction_var.set(
+            f"✓  Assembly complete!\n\n"
+            f"Total time: {duration}\n\n"
+            f"Bar: {bar_id}   Length: {self._current_bar_length_mm:g} mm   "
+            f"Seq: #{self._current_bar_seq}"
+        )
+        self._enter_label_print_step()
+
+    def _enter_label_print_step(self) -> None:
+        """Configure the done page in 'ready to print label' state."""
+        self.confirm_btn.configure(
+            state=tk.NORMAL, text="Print Label  (Enter)",
+            bg="#4CAF50", activebackground="#43A047",
+        )
+        self._confirm_action = "label_print"
+        self._show_skip_label_btn()
+        self._refresh_label_status_text()
+
+    def _show_skip_label_btn(self) -> None:
+        """Lazy-create and show the 'Skip Label' button next to confirm."""
+        if not hasattr(self, "skip_label_btn"):
+            self.skip_label_btn = tk.Button(
+                self.assembly_frame, text="Skip Label",
+                font=("Segoe UI", 10), command=self._on_skip_label,
+                bg="#9E9E9E", fg="white",
+                activebackground="#757575", padx=12, pady=4,
+            )
+        if not self.skip_label_btn.winfo_ismapped():
+            self.skip_label_btn.pack(pady=(0, 8))
+        self.skip_label_btn.configure(state=tk.NORMAL)
+
+    def _hide_skip_label_btn(self) -> None:
+        if hasattr(self, "skip_label_btn") and self.skip_label_btn.winfo_ismapped():
+            self.skip_label_btn.pack_forget()
+
+    def _refresh_label_status_text(self) -> None:
+        """Update the done-page sub-status line based on printer state."""
+        if self._label_print_in_progress:
+            self.status_var.set("Printing label...")
+            return
+        if not label_printer.is_dependencies_available():
+            err = label_printer.import_error_message() or "unavailable"
+            self.status_var.set(
+                f"Label printer support is disabled ({err}).\n"
+                f"Press Skip Label to continue."
+            )
+            self.confirm_btn.configure(state=tk.DISABLED)
+            return
+        if not self._label_printer_present:
+            self.status_var.set(
+                "⚠  Label printer not detected.\n"
+                "Plug in the Brother PT printer and press Enter to retry, "
+                "or press Skip Label."
+            )
+            # Still allow Enter — it will re-check and print if available.
+            self.confirm_btn.configure(state=tk.NORMAL)
+            return
+        self.status_var.set(
+            "Label printer ready. Press Enter to print, or Skip Label."
+        )
+        self.confirm_btn.configure(state=tk.NORMAL)
+
+    def _on_skip_label(self) -> None:
+        """Operator chose to skip printing for this bar."""
+        if self._label_print_in_progress:
+            return
+        self._hide_skip_label_btn()
+        self.status_var.set("Label skipped.")
         self.confirm_btn.configure(
             state=tk.NORMAL, text="Back to Selection",
             bg="#607D8B", activebackground="#546E7A",
         )
         self._confirm_action = "back_to_selection"
+
+    def _start_label_print(self) -> None:
+        """Trigger label printing in a background thread."""
+        if self._label_print_in_progress:
+            return
+        # Re-check presence right before printing in case device was
+        # unplugged between the last poll and the click.
+        if not label_printer.is_dependencies_available():
+            self._refresh_label_status_text()
+            return
+        if not label_printer.is_printer_present():
+            self._label_printer_present = False
+            self._refresh_label_status_text()
+            return
+
+        self._label_print_in_progress = True
+        self.confirm_btn.configure(state=tk.DISABLED, text="Printing...")
+        if hasattr(self, "skip_label_btn"):
+            self.skip_label_btn.configure(state=tk.DISABLED)
+        self.status_var.set("Printing label...")
+
+        bar_id = self._current_bar_id
+        length_mm = self._current_bar_length_mm
+        seq = self._current_bar_seq
+
+        def _worker() -> None:
+            try:
+                info = label_printer.print_bar_label(
+                    bar_id=bar_id, length_mm=length_mm,
+                    assembly_seq=seq,
+                )
+                self.after(0, lambda: self._label_print_done(True, info, None))
+            except Exception as exc:
+                err = str(exc)
+                self.after(0, lambda: self._label_print_done(False, None, err))
+
+        threading.Thread(target=_worker, daemon=True,
+                         name="label-print-worker").start()
+
+    def _label_print_done(self, ok: bool, info: Optional[dict],
+                          error: Optional[str]) -> None:
+        """Called on the main thread after the print attempt."""
+        self._label_print_in_progress = False
+        if ok:
+            media_w = (info or {}).get("media_width_mm", "?")
+            color = (info or {}).get("tape_color", "?")
+            self.status_var.set(
+                f"✓ Label printed (tape: {media_w} mm {color})."
+            )
+            self._hide_skip_label_btn()
+            self.confirm_btn.configure(
+                state=tk.NORMAL, text="Back to Selection",
+                bg="#607D8B", activebackground="#546E7A",
+            )
+            self._confirm_action = "back_to_selection"
+        else:
+            self.status_var.set(
+                f"⚠  Label print failed: {error}\n"
+                "Fix the issue (e.g. plug printer in / close cover) and "
+                "press Enter to retry, or press Skip Label."
+            )
+            self.confirm_btn.configure(
+                state=tk.NORMAL, text="Retry Print  (Enter)",
+                bg="#4CAF50", activebackground="#43A047",
+            )
+            if hasattr(self, "skip_label_btn"):
+                self.skip_label_btn.configure(state=tk.NORMAL)
+            self._confirm_action = "label_print"
 
     # ─────────────────────────────────────────────────────────────
     #  Linear position colour bar drawing
@@ -1087,7 +1304,7 @@ class JigApp(tk.Tk):
         """Rebuild the bar Treeview from the current design + log."""
         self.bar_tree.delete(*self.bar_tree.get_children())
         self.detail_label.configure(text="")
-        self.start_btn.configure(state=tk.DISABLED)
+        self._update_selection_action_buttons()
 
         if not self.bars or not self.log_path:
             return
@@ -1113,8 +1330,8 @@ class JigApp(tk.Tk):
         """Called when the user clicks a row in the bar table."""
         sel = self.bar_tree.selection()
         if not sel:
-            self.start_btn.configure(state=tk.DISABLED)
             self.detail_label.configure(text="")
+            self._update_selection_action_buttons()
             return
 
         idx = int(sel[0])
@@ -1138,9 +1355,117 @@ class JigApp(tk.Tk):
                 f"pos={pos}mm  rot={rot}°"
             )
         self.detail_label.configure(text="\n".join(lines))
+        self._update_selection_action_buttons()
 
-        if self.hub is not None:
-            self.start_btn.configure(state=tk.NORMAL)
+    def _update_selection_action_buttons(self) -> None:
+        """Update selection-screen button enable/disable states."""
+        sel = self.bar_tree.selection()
+        has_selection = bool(sel)
+
+        # Existing behavior: assembly requires jig hardware connection.
+        can_start = has_selection and (self.hub is not None)
+        self.start_btn.configure(state=tk.NORMAL if can_start else tk.DISABLED)
+
+        # New behavior: label reprint works without jig hardware, but only
+        # when printer deps are available and the printer is detected.
+        can_print = (
+            has_selection
+            and not self._selection_label_print_in_progress
+            and label_printer.is_dependencies_available()
+            and self._label_printer_present
+        )
+        self.print_label_btn.configure(
+            state=tk.NORMAL if can_print else tk.DISABLED,
+            text="Print Label" if not self._selection_label_print_in_progress
+            else "Printing...",
+        )
+
+    def _on_print_label_from_selection(self) -> None:
+        """Print a label for the selected bar directly from selection UI."""
+        if self._selection_label_print_in_progress:
+            return
+
+        sel = self.bar_tree.selection()
+        if not sel:
+            return
+
+        idx = int(sel[0])
+        bar = self.bars[idx]
+        bar_id = str(bar.get("bar_id", f"bar_{idx}"))
+        seq = idx + 1
+        try:
+            length_mm = float(bar.get("length_mm", 0.0))
+        except (TypeError, ValueError):
+            length_mm = 0.0
+
+        # Re-check availability right before print in case of hot unplug.
+        if not label_printer.is_dependencies_available():
+            messagebox.showerror(
+                "Label Printer",
+                f"Label printer support is unavailable:\n"
+                f"{label_printer.import_error_message() or 'unknown error'}",
+            )
+            self._update_selection_action_buttons()
+            return
+        if not label_printer.is_printer_present():
+            self._label_printer_present = False
+            self._update_selection_action_buttons()
+            messagebox.showwarning(
+                "Label Printer Not Detected",
+                "Brother label printer not detected. Plug it in and try again.",
+            )
+            return
+
+        self._selection_label_print_in_progress = True
+        self._update_selection_action_buttons()
+
+        def _worker() -> None:
+            try:
+                info = label_printer.print_bar_label(
+                    bar_id=bar_id,
+                    length_mm=length_mm,
+                    assembly_seq=seq,
+                )
+                self.after(0, lambda: self._selection_print_done(
+                    True, bar_id, seq, info, None
+                ))
+            except Exception as exc:
+                self.after(0, lambda: self._selection_print_done(
+                    False, bar_id, seq, None, str(exc)
+                ))
+
+        threading.Thread(
+            target=_worker, daemon=True,
+            name="selection-label-print-worker",
+        ).start()
+
+    def _selection_print_done(
+        self,
+        ok: bool,
+        bar_id: str,
+        seq: int,
+        info: Optional[dict],
+        error: Optional[str],
+    ) -> None:
+        """Handle completion of selection-screen label print."""
+        self._selection_label_print_in_progress = False
+        self._update_selection_action_buttons()
+
+        if ok:
+            media_w = (info or {}).get("media_width_mm", "?")
+            color = (info or {}).get("tape_color", "?")
+            messagebox.showinfo(
+                "Label Printed",
+                f"Printed label for bar {bar_id} (seq #{seq}).\n"
+                f"Tape: {media_w} mm {color}",
+            )
+        else:
+            messagebox.showwarning(
+                "Label Print Failed",
+                f"Could not print label for bar {bar_id} (seq #{seq}).\n\n"
+                f"{error}\n\n"
+                "Plug in / check the printer and try again.",
+            )
 
     # ─────────────────────────────────────────────────────────────
     #  Screen switching helpers
@@ -1183,6 +1508,14 @@ class JigApp(tk.Tk):
         idx = int(sel[0])
         bar = self.bars[idx]
         bar_id = str(bar.get("bar_id", f"bar_{idx}"))
+
+        # Capture bar metadata for the post-assembly label print step.
+        try:
+            self._current_bar_length_mm = float(bar.get("length_mm", 0.0))
+        except (TypeError, ValueError):
+            self._current_bar_length_mm = 0.0
+        # Use 1-based design-file position as the assembly sequence.
+        self._current_bar_seq = idx + 1
 
         try:
             validate_offsets_complete(bar, self.offset_map)
@@ -1247,12 +1580,15 @@ class JigApp(tk.Tk):
         elif action == "stall_retry":
             self.stall_retry_event.set()
             self.confirm_btn.configure(state=tk.DISABLED)
+        elif action == "label_print":
+            self._start_label_print()
         elif action == "back_to_selection":
             # Restore default confirm button colours before switching
             self.confirm_btn.configure(
                 bg="#2196F3", activebackground="#1976D2",
             )
             self.abandon_btn.configure(state=tk.NORMAL)
+            self._hide_skip_label_btn()
             self._show_selection()
 
     def _on_abandon(self) -> None:

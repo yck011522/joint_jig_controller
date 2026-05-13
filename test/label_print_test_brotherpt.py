@@ -112,7 +112,7 @@ TAPE_LENGTH_MM = 75.0
 LENGTH_CALIBRATION_MM = 4.0
 
 # Vertical gap (px) between the two text rows.
-ROW_GAP_PX = 4
+ROW_GAP_PX = 0
 
 DPI = 180
 
@@ -127,12 +127,25 @@ CUT_MARGIN_DOTS = 14
 # the text comfortably fits on the tape width you actually load.
 # Reference: 12 mm laminated tape -> printable height = 70 px, so each
 # row gets ~33 px after subtracting ROW_GAP_PX.
-FONT_SIZE_PX = 28
+FONT_SIZE_PX = 27
 
 # Box style for numeric length text like "1500".
-LENGTH_BOX_PAD_X_PX = 2
-LENGTH_BOX_PAD_Y_PX = 3
+LENGTH_BOX_PAD_X_PX = 3
+LENGTH_BOX_PAD_Y_PX = 4
 LENGTH_BOX_STROKE_PX = 1
+# Negative values tighten spacing between characters.
+CHAR_TRACKING_PX = -0.35
+
+# Fixed field widths (in characters) so short values don't collapse to
+# the left compared to max-length values.
+SEQ_FIELD_CHARS = 5      # e.g. "#5   " .. "#122 "
+BAR_ID_FIELD_CHARS = 5   # e.g. "B5   " .. "B123 "
+LENGTH_FIELD_CHARS = 5   # e.g. "500  " .. "1500 "
+
+# Extra manual spacing between info chunks (in pixels). These are in
+# addition to the fixed field widths above.
+SEQ_TO_BAR_GAP_PX = 0.0
+BAR_TO_LENGTH_GAP_PX = 0.0
 # -------------------------------------------------------------------- #
 
 # What we want to print on the tape. Short format:
@@ -141,14 +154,24 @@ BAR_ID = "B017"
 BAR_LENGTH_MM = 1500
 ASSEMBLY_SEQ = 122
 
+# BAR_ID = "B1"
+# BAR_LENGTH_MM = 150
+# ASSEMBLY_SEQ = 1
+
+# Windows monospace fonts so padded fields align visually.
+# Prefer Courier New first, then fall back to Consolas.
 REGULAR_FONT_CANDIDATES = [
-    r"C:\Windows\Fonts\arial.ttf",
-    r"C:\Windows\Fonts\ARIAL.TTF",
+    r"C:\Windows\Fonts\cour.ttf",      # Courier New Regular
+    r"C:\Windows\Fonts\COUR.TTF",
+    r"C:\Windows\Fonts\consola.ttf",   # Consolas Regular fallback
+    r"C:\Windows\Fonts\CONSOLA.TTF",
 ]
 
 BOLD_FONT_CANDIDATES = [
-    r"C:\Windows\Fonts\arialbd.ttf",
-    r"C:\Windows\Fonts\ARIALBD.TTF",
+    r"C:\Windows\Fonts\courbd.ttf",    # Courier New Bold
+    r"C:\Windows\Fonts\COURBD.TTF",
+    r"C:\Windows\Fonts\consolab.ttf",  # Consolas Bold fallback
+    r"C:\Windows\Fonts\CONSOLAB.TTF",
 ]
 
 
@@ -166,11 +189,17 @@ def build_row_texts(bar_id: str, length_mm: int, seq: int) -> tuple[str, str]:
     wrapped tube is visible, at least one full ``#<seq> <bar_id>
     <len>`` reads cleanly.
     """
-    block = f"#{seq} {bar_id} {length_mm}"
-    tail = f"{length_mm}"
-    head = f"#{seq} {bar_id}"
-    row1 = f"{block} {block}"
-    row2 = f"{tail} {block} {head}"
+    seq_field = f"#{seq}".ljust(SEQ_FIELD_CHARS)
+    bar_field = str(bar_id).ljust(BAR_ID_FIELD_CHARS)
+    len_field = str(length_mm).ljust(LENGTH_FIELD_CHARS)
+
+    # Keep the same semantic pattern as before, but in fixed-width
+    # chunks so each block occupies a stable width across bars.
+    block = f"{seq_field}{bar_field}{len_field}"
+    tail = len_field
+    head = f"{seq_field}{bar_field}"
+    row1 = f"{block}{block}"
+    row2 = f"{tail}{block}{head}"
     return row1, row2
 
 
@@ -183,6 +212,40 @@ def _measure(text: str, font: ImageFont.FreeTypeFont) -> tuple[int, int, int, in
     return ImageDraw.Draw(Image.new("L", (1, 1))).textbbox((0, 0), text, font=font)
 
 
+def _text_advance(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.FreeTypeFont,
+) -> float:
+    """Measure horizontal advance with configurable char tracking."""
+    if not text:
+        return 0.0
+    total = 0.0
+    for idx, ch in enumerate(text):
+        total += float(draw.textlength(ch, font=font))
+        if idx < len(text) - 1:
+            total += CHAR_TRACKING_PX
+    return total
+
+
+def _draw_text_with_tracking(
+    draw: ImageDraw.ImageDraw,
+    x: float,
+    y: int,
+    text: str,
+    font: ImageFont.FreeTypeFont,
+    fill: int = 0,
+) -> float:
+    """Draw text char-by-char and return the rendered advance width."""
+    cursor = float(x)
+    for idx, ch in enumerate(text):
+        draw.text((cursor, y), ch, font=font, fill=fill)
+        cursor += float(draw.textlength(ch, font=font))
+        if idx < len(text) - 1:
+            cursor += CHAR_TRACKING_PX
+    return cursor - x
+
+
 def _pick_font_path(candidates: list[str], label: str) -> str:
     font_path = next((p for p in candidates if Path(p).exists()), None)
     if font_path is None:
@@ -191,14 +254,8 @@ def _pick_font_path(candidates: list[str], label: str) -> str:
 
 
 def _tokenize_with_spaces(text: str) -> list[str]:
-    """Split by spaces but keep spaces as explicit tokens."""
-    words = text.split(" ")
-    tokens: list[str] = []
-    for idx, word in enumerate(words):
-        tokens.append(word)
-        if idx < len(words) - 1:
-            tokens.append(" ")
-    return tokens
+    """Preserve runs of spaces as explicit tokens."""
+    return re.findall(r"\S+|\s+", text)
 
 
 def _split_length_token(token: str) -> str | None:
@@ -207,6 +264,20 @@ def _split_length_token(token: str) -> str | None:
     if match is None:
         return None
     return match.group(1)
+
+
+def _token_kind(token: str, bar_id: str) -> str | None:
+    """Classify semantic token kind for inter-field spacing control."""
+    stripped = token.strip()
+    if not stripped:
+        return None
+    if stripped == bar_id:
+        return "bar"
+    if re.fullmatch(r"#\d+", stripped):
+        return "seq"
+    if _split_length_token(stripped) is not None:
+        return "len"
+    return None
 
 
 def _segment_metrics(
@@ -219,15 +290,15 @@ def _segment_metrics(
     """Return (advance_width, y_min, y_max) for one token segment."""
     if token == bar_id:
         x0, y0, x1, y1 = _measure(token, bold_font)
-        return float(draw.textlength(token, font=bold_font)), y0, y1
+        return _text_advance(draw, token, bold_font), y0, y1
 
     length_digits = _split_length_token(token)
     if length_digits is None:
         x0, y0, x1, y1 = _measure(token, regular_font)
-        return float(draw.textlength(token, font=regular_font)), y0, y1
+        return _text_advance(draw, token, regular_font), y0, y1
 
     nx0, ny0, nx1, ny1 = _measure(length_digits, regular_font)
-    num_w = float(draw.textlength(length_digits, font=regular_font))
+    num_w = _text_advance(draw, length_digits, regular_font)
     box_w = num_w + (2 * LENGTH_BOX_PAD_X_PX)
     advance = box_w
     y_min = ny0 - LENGTH_BOX_PAD_Y_PX
@@ -246,17 +317,19 @@ def _draw_segment(
 ) -> float:
     """Draw one token segment and return its horizontal advance."""
     if token == bar_id:
-        draw.text((cursor_x, baseline_y), token, font=bold_font, fill=0)
-        return float(draw.textlength(token, font=bold_font))
+        return _draw_text_with_tracking(
+            draw, cursor_x, baseline_y, token, bold_font, fill=0
+        )
 
     length_digits = _split_length_token(token)
     if length_digits is None:
-        draw.text((cursor_x, baseline_y), token, font=regular_font, fill=0)
-        return float(draw.textlength(token, font=regular_font))
+        return _draw_text_with_tracking(
+            draw, cursor_x, baseline_y, token, regular_font, fill=0
+        )
 
     nx0, ny0, _nx1, ny1 = _measure(length_digits, regular_font)
 
-    num_w = float(draw.textlength(length_digits, font=regular_font))
+    num_w = _text_advance(draw, length_digits, regular_font)
     box_w = num_w + (2 * LENGTH_BOX_PAD_X_PX)
 
     rect_left = cursor_x
@@ -269,10 +342,12 @@ def _draw_segment(
         width=LENGTH_BOX_STROKE_PX,
     )
 
-    draw.text(
-        (cursor_x + LENGTH_BOX_PAD_X_PX - nx0, baseline_y),
+    _draw_text_with_tracking(
+        draw,
+        cursor_x + LENGTH_BOX_PAD_X_PX - nx0,
+        baseline_y,
         length_digits,
-        font=regular_font,
+        regular_font,
         fill=0,
     )
     return box_w
@@ -314,10 +389,18 @@ def _draw_row_left_aligned(
     y = row_top_px + (row_height_px - text_h) // 2 - min_y
 
     cursor_x = float(x)
+    prev_kind: str | None = None
     for token in tokens:
+        kind = _token_kind(token, bar_id)
+        if prev_kind == "seq" and kind == "bar":
+            cursor_x += SEQ_TO_BAR_GAP_PX
+        elif prev_kind == "bar" and kind == "len":
+            cursor_x += BAR_TO_LENGTH_GAP_PX
         cursor_x += _draw_segment(
             token, draw, cursor_x, y, regular_font, bold_font, bar_id,
         )
+        if kind is not None:
+            prev_kind = kind
 
 
 def render_label_image(
@@ -402,7 +485,7 @@ def main() -> int:
     #    (no media / cutter jam / cover open / overheating ...)
     #    print_image() will raise a RuntimeError with a decoded message.
     print("Sending to printer ...")
-    printer.print_image(img, margin_px=CUT_MARGIN_DOTS)
+    # printer.print_image(img, margin_px=CUT_MARGIN_DOTS)
     print("Print job complete - the cutter should have fired.")
     return 0
 
