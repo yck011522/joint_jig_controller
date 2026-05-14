@@ -117,7 +117,7 @@ class AssemblyWorker(threading.Thread):
 
     def __init__(
         self,
-        hub: HardwareHub,
+        hub: Optional[HardwareHub],
         msg_queue: queue.Queue,
         bar: dict,
         bar_id: str,
@@ -132,6 +132,7 @@ class AssemblyWorker(threading.Thread):
         confirm_linear_event: threading.Event,
         confirm_install_event: threading.Event,
         stall_retry_event: threading.Event,
+        simulate_mode: bool = False,
     ):
         super().__init__(daemon=True, name="assembly-worker")
         self.hub = hub
@@ -148,6 +149,8 @@ class AssemblyWorker(threading.Thread):
         self.confirm_linear = confirm_linear_event
         self.confirm_install = confirm_install_event
         self.stall_retry = stall_retry_event
+        self.simulate_mode = simulate_mode
+        self._sim_motor_deg = 0.0
 
     # ── helpers ──────────────────────────────────────────────────
 
@@ -166,8 +169,12 @@ class AssemblyWorker(threading.Thread):
             self._post("error", message=str(e))
 
     def _run_assembly(self) -> None:
-        # Zero motor at the start of each bar
-        self.hub.zero_here()
+        if not self.simulate_mode and self.hub is None:
+            raise RuntimeError("Hardware is not connected.")
+
+        # Zero motor at the start of each bar (real hardware only).
+        if not self.simulate_mode and self.hub is not None:
+            self.hub.zero_here()
 
         bar_start = time.perf_counter()
 
@@ -210,28 +217,50 @@ class AssemblyWorker(threading.Thread):
             self.confirm_linear.clear()
             linear_start = time.perf_counter()
 
-            # Poll sensor via hub until the GUI signals confirmation
-            while not self.confirm_linear.is_set() and not self.abandon.is_set():
-                try:
-                    raw_mm = self.hub.read_sensor_mm_sync()
-                except Exception:
-                    time.sleep(0.2)
-                    continue
-                measured = float(raw_mm) + self.cfg.linear.sensor_global_offset_mm
-                error = measured - target_mm
-                self._post("linear_update",
-                           raw_mm=raw_mm, measured_mm=measured,
-                           target_mm=target_mm, error_mm=error)
-                time.sleep(0.1)
+            # Poll sensor (real) or emit synthetic values (simulation)
+            # until the GUI signals confirmation.
+            if self.simulate_mode:
+                while (not self.confirm_linear.is_set()
+                       and not self.abandon.is_set()):
+                    raw_mm = target_mm - self.cfg.linear.sensor_global_offset_mm
+                    measured = target_mm
+                    error = 0.0
+                    self._post(
+                        "linear_update",
+                        raw_mm=raw_mm,
+                        measured_mm=measured,
+                        target_mm=target_mm,
+                        error_mm=error,
+                    )
+                    time.sleep(0.1)
+            else:
+                while (not self.confirm_linear.is_set()
+                       and not self.abandon.is_set()):
+                    try:
+                        raw_mm = self.hub.read_sensor_mm_sync()
+                    except Exception:
+                        time.sleep(0.2)
+                        continue
+                    measured = float(raw_mm) + self.cfg.linear.sensor_global_offset_mm
+                    error = measured - target_mm
+                    self._post("linear_update",
+                               raw_mm=raw_mm, measured_mm=measured,
+                               target_mm=target_mm, error_mm=error)
+                    time.sleep(0.1)
 
             if self.abandon.is_set():
                 break
 
             # Log the linear confirmation
             linear_ms = int((time.perf_counter() - linear_start) * 1000)
-            raw_mm = self.hub.read_sensor_mm_sync()
-            measured = float(raw_mm) + self.cfg.linear.sensor_global_offset_mm
-            error = measured - target_mm
+            if self.simulate_mode:
+                raw_mm = target_mm - self.cfg.linear.sensor_global_offset_mm
+                measured = target_mm
+                error = 0.0
+            else:
+                raw_mm = self.hub.read_sensor_mm_sync()
+                measured = float(raw_mm) + self.cfg.linear.sensor_global_offset_mm
+                error = measured - target_mm
             self._log_event({
                 "ts": now_iso_local(),
                 "event": EVENT_LINEAR_CONFIRM,
@@ -274,12 +303,35 @@ class AssemblyWorker(threading.Thread):
                 while not self.stall_retry.is_set() and not self.abandon.is_set():
                     time.sleep(0.1)
 
-            rot_result = self.hub.rotate_with_stall_detection(
-                rotation_deg, self.cfg.motion, self.cfg.stall,
-                on_progress=on_progress,
-                on_stall=on_stall,
-                abort=self.abandon,
-            )
+            if self.simulate_mode:
+                rot_start = time.perf_counter()
+                start_deg = self._sim_motor_deg
+                steps = max(10, int(abs(rotation_deg - start_deg) // 5) + 1)
+                for step in range(1, steps + 1):
+                    if self.abandon.is_set():
+                        break
+                    actual_deg = (
+                        start_deg
+                        + (rotation_deg - start_deg) * (step / steps)
+                    )
+                    self._sim_motor_deg = actual_deg
+                    on_progress(actual_deg, rotation_deg)
+                    time.sleep(0.05)
+                rotation_ms = int((time.perf_counter() - rot_start) * 1000)
+                rot_result = RotationResult(
+                    reached=not self.abandon.is_set(),
+                    target_deg=rotation_deg,
+                    actual_deg=self._sim_motor_deg,
+                    rotation_time_ms=rotation_ms,
+                    stall_events=[],
+                )
+            else:
+                rot_result = self.hub.rotate_with_stall_detection(
+                    rotation_deg, self.cfg.motion, self.cfg.stall,
+                    on_progress=on_progress,
+                    on_stall=on_stall,
+                    abort=self.abandon,
+                )
 
             if self.abandon.is_set():
                 break
@@ -402,6 +454,8 @@ class JigApp(tk.Tk):
         self._label_printer_present: bool = False
         self._label_print_in_progress: bool = False
         self._selection_label_print_in_progress: bool = False
+        self.simulate_mode_var = tk.BooleanVar(value=False)
+        self._sim_motor_display_deg: float = 0.0
         # Cached info about the bar currently being assembled, captured
         # at start so we can print a label after completion.
         self._current_bar_id: str = ""
@@ -627,6 +681,19 @@ class JigApp(tk.Tk):
         )
         # Not packed yet — shown only when connection is lost
 
+        # Engineer-only simulation toggle.
+        self._add_eng_label("Simulation")
+        self.sim_mode_chk = tk.Checkbutton(
+            self.right_panel,
+            text="Enable simulation mode",
+            variable=self.simulate_mode_var,
+            command=self._on_simulation_mode_toggled,
+            bg="#e8e8e8",
+            activebackground="#e8e8e8",
+            font=("Segoe UI", 9),
+        )
+        self.sim_mode_chk.pack(anchor=tk.W, padx=10)
+
         # Motion settings display
         self._add_eng_label("Motion Settings")
         self.eng_motion_var = tk.StringVar(value="—")
@@ -641,6 +708,38 @@ class JigApp(tk.Tk):
             bg="#e8e8e8", font=("Consolas", 9), fg="#555",
         )
         self.eng_label_printer_lbl.pack(anchor=tk.W, padx=10)
+
+    def _is_simulation_mode(self) -> bool:
+        return bool(self.simulate_mode_var.get())
+
+    def _on_simulation_mode_toggled(self) -> None:
+        """Handle simulation mode toggle from the engineer panel."""
+        if self._is_simulation_mode():
+            if self.hub and self.hub.connected:
+                self.eng_conn_var.set(
+                    f"Port: {self.hub.port}\n"
+                    "Status: Connected (SIMULATION BYPASS)"
+                )
+            else:
+                self.eng_conn_var.set("Status: SIMULATION (no hardware required)")
+            self.eng_flags_var.set("SIMULATION")
+            self.eng_motor_var.set(f"{self._sim_motor_display_deg:.3f}°")
+            self.status_var.set(
+                "Simulation mode enabled: hardware motion and label "
+                "printing are virtual."
+            )
+        else:
+            self.status_var.set("")
+            self.eng_flags_var.set("—")
+            if self.hub and self.hub.connected:
+                self.eng_conn_var.set(
+                    f"Port: {self.hub.port}\n"
+                    "Status: Connected"
+                )
+            elif not self.hub:
+                self.eng_conn_var.set("DISCONNECTED")
+        self._refresh_label_status_text()
+        self._update_selection_action_buttons()
 
     def _add_eng_label(self, text: str) -> None:
         """Add a small section header in the engineer panel."""
@@ -688,8 +787,9 @@ class JigApp(tk.Tk):
                 f"Status: Connected"
             )
         except RuntimeError as e:
-            messagebox.showerror("Hardware Error", str(e))
+            # Keep startup non-blocking when hardware is missing.
             self.eng_conn_var.set("DISCONNECTED")
+            self.eng_sensor_var.set("DISCONNECTED")
             self.reconnect_btn.pack(anchor=tk.W, padx=10, pady=(4, 0))
 
         # Start the GUI refresh loop (reads from hub + drains queues)
@@ -745,7 +845,17 @@ class JigApp(tk.Tk):
         cached values and drains the assembly message queue."""
 
         # ── Refresh engineer panel from hub ──────────────────────
-        if self.hub:
+        if self._is_simulation_mode():
+            self.eng_flags_var.set("SIMULATION")
+            self.eng_motor_var.set(f"{self._sim_motor_display_deg:.3f}°")
+            if self.hub and self.hub.connected:
+                self.eng_conn_var.set(
+                    f"Port: {self.hub.port}\n"
+                    "Status: Connected (SIMULATION BYPASS)"
+                )
+            else:
+                self.eng_conn_var.set("Status: SIMULATION (no hardware required)")
+        elif self.hub:
             if not self.hub.connected:
                 self.eng_sensor_var.set("DISCONNECTED")
                 self.eng_conn_var.set("DISCONNECTED")
@@ -792,7 +902,11 @@ class JigApp(tk.Tk):
         engineer-panel label and an internal flag; the done-page status
         text is refreshed from this flag the next time it is shown.
         """
-        if not label_printer.is_dependencies_available():
+        if self._is_simulation_mode():
+            self._label_printer_present = True
+            self.eng_label_printer_var.set("SIMULATED")
+            self.eng_label_printer_lbl.configure(fg="#2e7d32")
+        elif not label_printer.is_dependencies_available():
             self._label_printer_present = False
             err = label_printer.import_error_message() or "unavailable"
             short = err.split(":")[0]
@@ -876,7 +990,11 @@ class JigApp(tk.Tk):
                 self.rot_progress["value"] = 0
                 self.rot_progress_info_var.set("")
                 # Store target for progress calculation
-                self._rotation_start_deg = self.hub.motor_deg or 0.0
+                self._rotation_start_deg = (
+                    self.hub.motor_deg
+                    if self.hub and self.hub.motor_deg is not None
+                    else 0.0
+                )
                 self._rotation_target_deg = target_deg
 
             elif phase == "install":
@@ -914,6 +1032,8 @@ class JigApp(tk.Tk):
         elif msg.kind == "rotation_progress":
             actual = d["actual_deg"]
             target = d["target_deg"]
+            if self._is_simulation_mode():
+                self._sim_motor_display_deg = float(actual)
             start = getattr(self, "_rotation_start_deg", 0.0)
             total_span = abs(target - start)
             if total_span > 0.001:
@@ -930,6 +1050,8 @@ class JigApp(tk.Tk):
             actual = d["actual_deg"]
             reached = d["reached"]
             ms = d["rotation_time_ms"]
+            if self._is_simulation_mode():
+                self._sim_motor_display_deg = float(actual)
             self.rot_progress["value"] = 100
             self.rot_progress_info_var.set("")
             self.status_var.set(
@@ -1050,6 +1172,13 @@ class JigApp(tk.Tk):
         if self._label_print_in_progress:
             self.status_var.set("Printing label...")
             return
+        if self._is_simulation_mode():
+            self.status_var.set(
+                "Simulation mode: label print is virtual. "
+                "Press Enter to simulate print, or Skip Label."
+            )
+            self.confirm_btn.configure(state=tk.NORMAL)
+            return
         if not label_printer.is_dependencies_available():
             err = label_printer.import_error_message() or "unavailable"
             self.status_var.set(
@@ -1087,6 +1216,21 @@ class JigApp(tk.Tk):
     def _start_label_print(self) -> None:
         """Trigger label printing in a background thread."""
         if self._label_print_in_progress:
+            return
+        if self._is_simulation_mode():
+            self._label_print_in_progress = True
+            self.confirm_btn.configure(state=tk.DISABLED, text="Simulating...")
+            if hasattr(self, "skip_label_btn"):
+                self.skip_label_btn.configure(state=tk.DISABLED)
+            self.status_var.set("Simulating label print...")
+            self.after(
+                250,
+                lambda: self._label_print_done(
+                    True,
+                    {"media_width_mm": "SIM", "tape_color": "virtual"},
+                    None,
+                ),
+            )
             return
         # Re-check presence right before printing in case device was
         # unplugged between the last poll and the click.
@@ -1362,18 +1506,20 @@ class JigApp(tk.Tk):
         sel = self.bar_tree.selection()
         has_selection = bool(sel)
 
-        # Existing behavior: assembly requires jig hardware connection.
-        can_start = has_selection and (self.hub is not None)
+        # Simulation mode allows assembly without real hardware.
+        can_start = has_selection and (
+            self._is_simulation_mode() or (self.hub is not None)
+        )
         self.start_btn.configure(state=tk.NORMAL if can_start else tk.DISABLED)
 
-        # New behavior: label reprint works without jig hardware, but only
-        # when printer deps are available and the printer is detected.
-        can_print = (
-            has_selection
-            and not self._selection_label_print_in_progress
-            and label_printer.is_dependencies_available()
-            and self._label_printer_present
-        )
+        # Simulation mode allows virtual label printing.
+        can_print = has_selection and not self._selection_label_print_in_progress
+        if not self._is_simulation_mode():
+            can_print = (
+                can_print
+                and label_printer.is_dependencies_available()
+                and self._label_printer_present
+            )
         self.print_label_btn.configure(
             state=tk.NORMAL if can_print else tk.DISABLED,
             text="Print Label" if not self._selection_label_print_in_progress
@@ -1397,6 +1543,21 @@ class JigApp(tk.Tk):
             length_mm = float(bar.get("length_mm", 0.0))
         except (TypeError, ValueError):
             length_mm = 0.0
+
+        if self._is_simulation_mode():
+            self._selection_label_print_in_progress = True
+            self._update_selection_action_buttons()
+            self.after(
+                250,
+                lambda: self._selection_print_done(
+                    True,
+                    bar_id,
+                    seq,
+                    {"media_width_mm": "SIM", "tape_color": "virtual"},
+                    None,
+                ),
+            )
+            return
 
         # Re-check availability right before print in case of hot unplug.
         if not label_printer.is_dependencies_available():
@@ -1502,7 +1663,9 @@ class JigApp(tk.Tk):
     def _on_start_assembly(self) -> None:
         """Validate, then switch to assembly screen and launch worker."""
         sel = self.bar_tree.selection()
-        if not sel or self.hub is None:
+        if not sel:
+            return
+        if not self._is_simulation_mode() and self.hub is None:
             return
 
         idx = int(sel[0])
@@ -1556,6 +1719,7 @@ class JigApp(tk.Tk):
             confirm_linear_event=self.confirm_linear_event,
             confirm_install_event=self.confirm_install_event,
             stall_retry_event=self.stall_retry_event,
+            simulate_mode=self._is_simulation_mode(),
         )
         self.assembly_worker.start()
 

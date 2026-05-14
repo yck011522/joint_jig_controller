@@ -87,6 +87,16 @@
                 "type": "T20_Female",
                 "ori": "N",
                 "rel_path": "T20_Female_N.jpg"
+            },
+            {
+                "type": "ground",
+                "ori": "P",
+                "rel_path": "ground_P.jpg"
+            },
+            {
+                "type": "ground",
+                "ori": "N",
+                "rel_path": "ground_N.jpg"
             }
         ]
     },
