@@ -84,6 +84,8 @@ from jig_controller import (
 POLL_INTERVAL_S = 1 / 30    # HardwareHub background poll interval (~30 Hz)
 GUI_DRAIN_MS = 100          # how often the GUI drains the message queue
 LABEL_PRINTER_POLL_MS = 2000  # how often to re-check label-printer USB presence
+JOG_STEP_DEG = 1.0
+JOG_INTERVAL_S = 0.10
 WINDOW_TITLE = "Joint Jig Controller"
 WINDOW_MIN_SIZE = (1100, 700)
 
@@ -456,6 +458,20 @@ class JigApp(tk.Tk):
         self._selection_label_print_in_progress: bool = False
         self.simulate_mode_var = tk.BooleanVar(value=False)
         self._sim_motor_display_deg: float = 0.0
+        self._jog_up_button_held: bool = False
+        self._jog_down_button_held: bool = False
+        self._jog_up_key_held: bool = False
+        self._jog_down_key_held: bool = False
+        self._jog_direction: int = 0
+        self._jog_target_deg: Optional[float] = None
+        self._jog_state_lock = threading.Lock()
+        self._jog_stop_event = threading.Event()
+        self._jog_thread = threading.Thread(
+            target=self._jog_loop,
+            daemon=True,
+            name="motor-jog-loop",
+        )
+        self._jog_thread.start()
         # Cached info about the bar currently being assembled, captured
         # at start so we can print a label after completion.
         self._current_bar_id: str = ""
@@ -631,12 +647,44 @@ class JigApp(tk.Tk):
         self.confirm_btn.pack(pady=10)
         # Bind Enter key globally for confirm
         self.bind("<Return>", lambda e: self._on_confirm())
+        self.bind("<KeyPress-Up>", self._on_jog_keypress_up)
+        self.bind("<KeyRelease-Up>", self._on_jog_keyrelease_up)
+        self.bind("<KeyPress-Down>", self._on_jog_keypress_down)
+        self.bind("<KeyRelease-Down>", self._on_jog_keyrelease_down)
 
         # Status text area (rotation result, stall messages, etc.)
         self.status_var = tk.StringVar(value="")
         tk.Label(self.assembly_frame, textvariable=self.status_var,
                  bg="#f0f0f0", font=("Segoe UI", 10),
                  wraplength=550, justify=tk.CENTER).pack(pady=5)
+
+        # Motor jog controls (shown only during linear positioning step).
+        self.jog_frame = tk.Frame(self.assembly_frame, bg="#f0f0f0")
+        tk.Label(
+            self.jog_frame,
+            text="Motor Jog (hold button or Up/Down key)",
+            bg="#f0f0f0",
+            font=("Segoe UI", 9, "bold"),
+            fg="#555",
+        ).pack()
+        jog_btn_row = tk.Frame(self.jog_frame, bg="#f0f0f0")
+        jog_btn_row.pack(pady=(4, 0))
+        self.jog_down_btn = tk.Button(
+            jog_btn_row, text="\u25bc Jog -", font=("Segoe UI", 10),
+            padx=14, pady=4,
+        )
+        self.jog_down_btn.pack(side=tk.LEFT, padx=(0, 8))
+        self.jog_up_btn = tk.Button(
+            jog_btn_row, text="\u25b2 Jog +", font=("Segoe UI", 10),
+            padx=14, pady=4,
+        )
+        self.jog_up_btn.pack(side=tk.LEFT)
+        self.jog_down_btn.bind("<ButtonPress-1>", self._on_jog_btn_press_down)
+        self.jog_down_btn.bind("<ButtonRelease-1>", self._on_jog_btn_release_down)
+        self.jog_down_btn.bind("<Leave>", self._on_jog_btn_release_down)
+        self.jog_up_btn.bind("<ButtonPress-1>", self._on_jog_btn_press_up)
+        self.jog_up_btn.bind("<ButtonRelease-1>", self._on_jog_btn_release_up)
+        self.jog_up_btn.bind("<Leave>", self._on_jog_btn_release_up)
 
         # ── Engineer panel (right side, always visible) ──────────
         tk.Label(self.right_panel, text="Engineer Panel", bg="#e8e8e8",
@@ -711,6 +759,102 @@ class JigApp(tk.Tk):
 
     def _is_simulation_mode(self) -> bool:
         return bool(self.simulate_mode_var.get())
+
+    def _can_jog_now(self) -> bool:
+        return getattr(self, "_confirm_action", None) == "linear"
+
+    def _on_jog_btn_press_up(self, _event=None) -> None:
+        self._jog_up_button_held = True
+        self._recompute_jog_direction()
+
+    def _on_jog_btn_release_up(self, _event=None) -> None:
+        self._jog_up_button_held = False
+        self._recompute_jog_direction()
+
+    def _on_jog_btn_press_down(self, _event=None) -> None:
+        self._jog_down_button_held = True
+        self._recompute_jog_direction()
+
+    def _on_jog_btn_release_down(self, _event=None) -> None:
+        self._jog_down_button_held = False
+        self._recompute_jog_direction()
+
+    def _on_jog_keypress_up(self, _event=None) -> None:
+        self._jog_up_key_held = True
+        self._recompute_jog_direction()
+
+    def _on_jog_keyrelease_up(self, _event=None) -> None:
+        self._jog_up_key_held = False
+        self._recompute_jog_direction()
+
+    def _on_jog_keypress_down(self, _event=None) -> None:
+        self._jog_down_key_held = True
+        self._recompute_jog_direction()
+
+    def _on_jog_keyrelease_down(self, _event=None) -> None:
+        self._jog_down_key_held = False
+        self._recompute_jog_direction()
+
+    def _recompute_jog_direction(self) -> None:
+        up_active = self._jog_up_button_held or self._jog_up_key_held
+        down_active = self._jog_down_button_held or self._jog_down_key_held
+        direction = (1 if up_active else 0) + (-1 if down_active else 0)
+        if not self._can_jog_now():
+            direction = 0
+        with self._jog_state_lock:
+            self._jog_direction = direction
+
+    def _stop_jog_inputs(self) -> None:
+        self._jog_up_button_held = False
+        self._jog_down_button_held = False
+        self._jog_up_key_held = False
+        self._jog_down_key_held = False
+        with self._jog_state_lock:
+            self._jog_direction = 0
+        self._jog_target_deg = None
+
+    def _show_jog_controls(self, show: bool) -> None:
+        if show:
+            if not self.jog_frame.winfo_ismapped():
+                self.jog_frame.pack(pady=(0, 8))
+        else:
+            if self.jog_frame.winfo_ismapped():
+                self.jog_frame.pack_forget()
+            self._stop_jog_inputs()
+
+    def _jog_loop(self) -> None:
+        while not self._jog_stop_event.is_set():
+            with self._jog_state_lock:
+                direction = self._jog_direction
+            if direction == 0 or not self._can_jog_now():
+                self._jog_target_deg = None
+                time.sleep(JOG_INTERVAL_S)
+                continue
+
+            try:
+                if self._is_simulation_mode():
+                    self._sim_motor_display_deg += direction * JOG_STEP_DEG
+                    if (
+                        self.assembly_worker is not None
+                        and getattr(self.assembly_worker, "simulate_mode", False)
+                    ):
+                        self.assembly_worker._sim_motor_deg = self._sim_motor_display_deg
+                elif self.hub is not None and self.cfg is not None:
+                    if self._jog_target_deg is None:
+                        base = self.hub.motor_deg
+                        if base is None:
+                            base = self.hub.read_motor_deg_sync()
+                        self._jog_target_deg = float(base)
+                    self._jog_target_deg += direction * JOG_STEP_DEG
+                    self.hub.send_move_absolute(
+                        self._jog_target_deg,
+                        speed_rpm=self.cfg.motion.rot_speed_rpm,
+                        acc=self.cfg.motion.rot_acc,
+                    )
+            except Exception:
+                pass
+
+            time.sleep(JOG_INTERVAL_S)
 
     def _on_simulation_mode_toggled(self) -> None:
         """Handle simulation mode toggle from the engineer panel."""
@@ -975,6 +1119,7 @@ class JigApp(tk.Tk):
                 self.bar_frame.pack(fill=tk.X, padx=30, pady=5)
                 self.rot_progress_frame.pack_forget()
                 self.rot_progress_info_var.set("")
+                self._show_jog_controls(True)
 
             elif phase == "rotating":
                 target_deg = d.get("target_deg", 0.0)
@@ -986,6 +1131,7 @@ class JigApp(tk.Tk):
                 self.bar_canvas.delete("all")
                 # Hide linear bar, show rotation progress bar
                 self.bar_frame.pack_forget()
+                self._show_jog_controls(False)
                 self.rot_progress_frame.pack(fill=tk.X, padx=30, pady=5)
                 self.rot_progress["value"] = 0
                 self.rot_progress_info_var.set("")
@@ -993,7 +1139,7 @@ class JigApp(tk.Tk):
                 self._rotation_start_deg = (
                     self.hub.motor_deg
                     if self.hub and self.hub.motor_deg is not None
-                    else 0.0
+                    else self._sim_motor_display_deg
                 )
                 self._rotation_target_deg = target_deg
 
@@ -1011,6 +1157,7 @@ class JigApp(tk.Tk):
                 self.linear_info_var.set("")
                 # Hide both bars during install
                 self.bar_frame.pack_forget()
+                self._show_jog_controls(False)
                 self.rot_progress_frame.pack_forget()
                 self.rot_progress_info_var.set("")
 
@@ -1102,6 +1249,7 @@ class JigApp(tk.Tk):
         self.image_label.configure(image="", text="")
         self._current_photo = None
         self.bar_frame.pack_forget()
+        self._show_jog_controls(False)
         self.rot_progress_frame.pack_forget()
         self.rot_progress_info_var.set("")
         self.linear_info_var.set("")
@@ -1634,6 +1782,7 @@ class JigApp(tk.Tk):
 
     def _show_selection(self) -> None:
         """Switch the left panel to the selection screen."""
+        self._show_jog_controls(False)
         self.assembly_frame.pack_forget()
         self.selection_frame.pack(fill=tk.BOTH, expand=True)
         self._refresh_bar_table()
@@ -1649,6 +1798,7 @@ class JigApp(tk.Tk):
         self.rot_progress["value"] = 0
         self.rot_progress_info_var.set("")
         self.confirm_btn.configure(state=tk.DISABLED)
+        self._show_jog_controls(False)
         self._current_photo = None
         self.image_label.configure(image="", text="")
         # Reset title labels
@@ -1774,6 +1924,9 @@ class JigApp(tk.Tk):
         self.confirm_linear_event.set()
         self.confirm_install_event.set()
         self.stall_retry_event.set()
+        self._jog_stop_event.set()
+        if self._jog_thread.is_alive():
+            self._jog_thread.join(timeout=1.0)
         if self.hub:
             try:
                 self.hub.close()
