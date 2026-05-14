@@ -209,7 +209,8 @@ All dependencies are listed in `requirements.txt`.
 
 ### Python Version Note
 
-The label printer library `brother_pt==1.0` pins `Pillow==8.4.0`.
+The label printer library `brother_pt` is installed from its GitHub repository via `requirements.txt`.
+This project keeps `Pillow==8.4.0` for compatibility with the current label printing workflow.
 For reliable installation, use Python 3.10 for this project environment.
 
 ## 4.1 Supervisory Control Software (Python)
