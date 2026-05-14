@@ -37,7 +37,6 @@ from __future__ import annotations
 import math
 import os
 import platform
-import re
 import sys
 from pathlib import Path
 
@@ -112,7 +111,7 @@ TAPE_LENGTH_MM = 75.0
 LENGTH_CALIBRATION_MM = 4.0
 
 # Vertical gap (px) between the two text rows.
-ROW_GAP_PX = 0
+LAYOUT_ROW_GAP_PX = 0
 
 DPI = 180
 
@@ -126,26 +125,30 @@ CUT_MARGIN_DOTS = 14
 # Font size (in pixels @ 180 dpi) used for both rows. Tune this until
 # the text comfortably fits on the tape width you actually load.
 # Reference: 12 mm laminated tape -> printable height = 70 px, so each
-# row gets ~33 px after subtracting ROW_GAP_PX.
-FONT_SIZE_PX = 27
+# row gets ~33 px after subtracting LAYOUT_ROW_GAP_PX.
+FONT_SIZE_PX = 36
 
 # Box style for numeric length text like "1500".
-LENGTH_BOX_PAD_X_PX = 3
+LENGTH_BOX_PAD_X_PX = 6
 LENGTH_BOX_PAD_Y_PX = 4
 LENGTH_BOX_STROKE_PX = 1
 # Negative values tighten spacing between characters.
-CHAR_TRACKING_PX = -0.35
+CHAR_TRACKING_PX = -1.0
 
-# Fixed field widths (in characters) so short values don't collapse to
-# the left compared to max-length values.
-SEQ_FIELD_CHARS = 5      # e.g. "#5   " .. "#122 "
-BAR_ID_FIELD_CHARS = 5   # e.g. "B5   " .. "B123 "
-LENGTH_FIELD_CHARS = 5   # e.g. "500  " .. "1500 "
-
-# Extra manual spacing between info chunks (in pixels). These are in
-# addition to the fixed field widths above.
-SEQ_TO_BAR_GAP_PX = 0.0
-BAR_TO_LENGTH_GAP_PX = 0.0
+# ---- Grid layout (anchor-based) ----
+# Number of anchor columns. Set to 5 (etc.) to add more anchors.
+LAYOUT_COLUMNS = 4
+# Left-anchored placement controls (in pixels).
+# Anchor X for column i is: LAYOUT_COLUMN_START_PX + i * LAYOUT_COLUMN_SPACING_PX
+LAYOUT_COLUMN_START_PX = 62.0
+LAYOUT_COLUMN_SPACING_PX = 105.0
+# Keep a little white space at the far right side of tape.
+LAYOUT_RIGHT_PADDING_PX = 10
+# Safety mode: if True, clamp/skip anchors that intrude into right padding.
+LAYOUT_ENFORCE_RIGHT_PADDING = True
+# Pattern cycle: piece kind for column index i in row r is
+#   LAYOUT_PATTERN[(i + r) % len(LAYOUT_PATTERN)]
+LAYOUT_PATTERN = ("bar", "seq", "len")
 # -------------------------------------------------------------------- #
 
 # What we want to print on the tape. Short format:
@@ -178,30 +181,6 @@ BOLD_FONT_CANDIDATES = [
 # --------------------------------------------------------------------- #
 # Helpers                                                               #
 # --------------------------------------------------------------------- #
-
-def build_row_texts(bar_id: str, length_mm: int, seq: int) -> tuple[str, str]:
-    """Build the two text rows.
-
-    Row 1: ``#<seq> <bar_id> <len> #<seq> <bar_id> <len>``
-    Row 2: ``<len> #<seq> <bar_id> <len> #<seq> <bar_id>``
-
-    The half-block shift in row 2 means that whichever side of the
-    wrapped tube is visible, at least one full ``#<seq> <bar_id>
-    <len>`` reads cleanly.
-    """
-    seq_field = f"#{seq}".ljust(SEQ_FIELD_CHARS)
-    bar_field = str(bar_id).ljust(BAR_ID_FIELD_CHARS)
-    len_field = str(length_mm).ljust(LENGTH_FIELD_CHARS)
-
-    # Keep the same semantic pattern as before, but in fixed-width
-    # chunks so each block occupies a stable width across bars.
-    block = f"{seq_field}{bar_field}{len_field}"
-    tail = len_field
-    head = f"{seq_field}{bar_field}"
-    row1 = f"{block}{block}"
-    row2 = f"{tail}{block}{head}"
-    return row1, row2
-
 
 def mm_to_dots(mm: float) -> int:
     return int(round(mm * DPI / 25.4))
@@ -253,174 +232,129 @@ def _pick_font_path(candidates: list[str], label: str) -> str:
     return font_path
 
 
-def _tokenize_with_spaces(text: str) -> list[str]:
-    """Preserve runs of spaces as explicit tokens."""
-    return re.findall(r"\S+|\s+", text)
-
-
-def _split_length_token(token: str) -> str | None:
-    """Return numeric length text for tokens like '1500' or '1500mm'."""
-    match = re.fullmatch(r"(\d+)(?:mm)?", token)
-    if match is None:
-        return None
-    return match.group(1)
-
-
-def _token_kind(token: str, bar_id: str) -> str | None:
-    """Classify semantic token kind for inter-field spacing control."""
-    stripped = token.strip()
-    if not stripped:
-        return None
-    if stripped == bar_id:
-        return "bar"
-    if re.fullmatch(r"#\d+", stripped):
-        return "seq"
-    if _split_length_token(stripped) is not None:
-        return "len"
-    return None
-
-
-def _segment_metrics(
-    token: str,
-    regular_font: ImageFont.FreeTypeFont,
-    bold_font: ImageFont.FreeTypeFont,
-    bar_id: str,
+def _render_piece(
+    kind: str,
+    value,
     draw: ImageDraw.ImageDraw,
-) -> tuple[float, int, int]:
-    """Return (advance_width, y_min, y_max) for one token segment."""
-    if token == bar_id:
-        x0, y0, x1, y1 = _measure(token, bold_font)
-        return _text_advance(draw, token, bold_font), y0, y1
-
-    length_digits = _split_length_token(token)
-    if length_digits is None:
-        x0, y0, x1, y1 = _measure(token, regular_font)
-        return _text_advance(draw, token, regular_font), y0, y1
-
-    nx0, ny0, nx1, ny1 = _measure(length_digits, regular_font)
-    num_w = _text_advance(draw, length_digits, regular_font)
-    box_w = num_w + (2 * LENGTH_BOX_PAD_X_PX)
-    advance = box_w
-    y_min = ny0 - LENGTH_BOX_PAD_Y_PX
-    y_max = ny1 + LENGTH_BOX_PAD_Y_PX
-    return advance, y_min, y_max
-
-
-def _draw_segment(
-    token: str,
-    draw: ImageDraw.ImageDraw,
-    cursor_x: float,
-    baseline_y: int,
+    x_center: float,
+    y_center: float,
     regular_font: ImageFont.FreeTypeFont,
     bold_font: ImageFont.FreeTypeFont,
-    bar_id: str,
-) -> float:
-    """Draw one token segment and return its horizontal advance."""
-    if token == bar_id:
-        return _draw_text_with_tracking(
-            draw, cursor_x, baseline_y, token, bold_font, fill=0
-        )
-
-    length_digits = _split_length_token(token)
-    if length_digits is None:
-        return _draw_text_with_tracking(
-            draw, cursor_x, baseline_y, token, regular_font, fill=0
-        )
-
-    nx0, ny0, _nx1, ny1 = _measure(length_digits, regular_font)
-
-    num_w = _text_advance(draw, length_digits, regular_font)
-    box_w = num_w + (2 * LENGTH_BOX_PAD_X_PX)
-
-    rect_left = cursor_x
-    rect_top = baseline_y + ny0 - LENGTH_BOX_PAD_Y_PX
-    rect_right = cursor_x + box_w - 1
-    rect_bottom = baseline_y + ny1 + LENGTH_BOX_PAD_Y_PX - 1
-    draw.rectangle(
-        [(rect_left, rect_top), (rect_right, rect_bottom)],
-        outline=0,
-        width=LENGTH_BOX_STROKE_PX,
-    )
-
-    _draw_text_with_tracking(
-        draw,
-        cursor_x + LENGTH_BOX_PAD_X_PX - nx0,
-        baseline_y,
-        length_digits,
-        regular_font,
-        fill=0,
-    )
-    return box_w
-
-
-def _draw_row_left_aligned(
-    img: Image.Image,
-    text: str,
-    regular_font: ImageFont.FreeTypeFont,
-    bold_font: ImageFont.FreeTypeFont,
-    bar_id: str,
-    row_top_px: int,
-    row_height_px: int,
 ) -> None:
-    draw = ImageDraw.Draw(img)
+    """Render one piece centered at (x_center, y_center).
 
-    tokens = _tokenize_with_spaces(text)
-
-    # Compute global vertical bounds across mixed regular/bold segments
-    # so the whole row remains vertically centered.
-    min_y = None
-    max_y = None
-    first_x0 = 0
-    for idx, token in enumerate(tokens):
-        advance, y0, y1 = _segment_metrics(
-            token, regular_font, bold_font, bar_id, draw,
-        )
-        if idx == 0:
-            first_x0 = 0
-        min_y = y0 if min_y is None else min(min_y, y0)
-        max_y = y1 if max_y is None else max(max_y, y1)
-
-    if min_y is None or max_y is None:
+    Supported ``kind`` values:
+      - "bar":  bar_id rendered in bold font
+      - "seq":  ``#<seq>`` rendered in regular font
+      - "len":  length integer rendered in regular font, inside a box
+    """
+    if kind == "bar":
+        text = str(value)
+        font = bold_font
+        w = _text_advance(draw, text, font)
+        x0, y0, x1, y1 = _measure(text, font)
+        h = y1 - y0
+        x_left = x_center - w / 2.0
+        y_top = y_center - h / 2.0 - y0
+        _draw_text_with_tracking(draw, x_left, int(round(y_top)),
+                                 text, font, fill=0)
         return
 
-    text_h = max_y - min_y
-    # Left-align text so any unused width remains on the right side.
-    x = -first_x0
-    y = row_top_px + (row_height_px - text_h) // 2 - min_y
+    if kind == "seq":
+        text = f"#{int(value)}"
+        font = regular_font
+        w = _text_advance(draw, text, font)
+        x0, y0, x1, y1 = _measure(text, font)
+        h = y1 - y0
+        x_left = x_center - w / 2.0
+        y_top = y_center - h / 2.0 - y0
+        _draw_text_with_tracking(draw, x_left, int(round(y_top)),
+                                 text, font, fill=0)
+        return
 
-    cursor_x = float(x)
-    prev_kind: str | None = None
-    for token in tokens:
-        kind = _token_kind(token, bar_id)
-        if prev_kind == "seq" and kind == "bar":
-            cursor_x += SEQ_TO_BAR_GAP_PX
-        elif prev_kind == "bar" and kind == "len":
-            cursor_x += BAR_TO_LENGTH_GAP_PX
-        cursor_x += _draw_segment(
-            token, draw, cursor_x, y, regular_font, bold_font, bar_id,
+    if kind == "len":
+        digits = str(int(value))
+        font = regular_font
+        num_w = _text_advance(draw, digits, font)
+        nx0, ny0, nx1, ny1 = _measure(digits, font)
+        text_h = ny1 - ny0
+        box_w = num_w + 2 * LENGTH_BOX_PAD_X_PX
+        box_h = text_h + 2 * LENGTH_BOX_PAD_Y_PX
+        rect_left = x_center - box_w / 2.0
+        rect_top = y_center - box_h / 2.0
+        rect_right = rect_left + box_w - 1
+        rect_bottom = rect_top + box_h - 1
+        draw.rectangle(
+            [(rect_left, rect_top), (rect_right, rect_bottom)],
+            outline=0, width=LENGTH_BOX_STROKE_PX,
         )
-        if kind is not None:
-            prev_kind = kind
+        text_x = rect_left + LENGTH_BOX_PAD_X_PX - nx0
+        text_y = rect_top + LENGTH_BOX_PAD_Y_PX - ny0
+        _draw_text_with_tracking(draw, text_x, int(round(text_y)),
+                                 digits, font, fill=0)
+        return
+
+    raise ValueError(f"Unknown piece kind: {kind!r}")
+
+
+def _draw_grid_row(
+    img: Image.Image,
+    row_index: int,
+    bar_id: str,
+    length_mm: int,
+    assembly_seq: int,
+    regular_font: ImageFont.FreeTypeFont,
+    bold_font: ImageFont.FreeTypeFont,
+    row_top_px: float,
+    row_height_px: float,
+) -> None:
+    """Draw one row of left-anchored column centers."""
+    draw = ImageDraw.Draw(img)
+    width = img.size[0]
+    n = max(1, int(LAYOUT_COLUMNS))
+    y_center = row_top_px + row_height_px / 2.0
+    x_limit = width - LAYOUT_RIGHT_PADDING_PX
+
+    for i in range(n):
+        kind = LAYOUT_PATTERN[(i + row_index) % len(LAYOUT_PATTERN)]
+        x_center = LAYOUT_COLUMN_START_PX + i * LAYOUT_COLUMN_SPACING_PX
+        if LAYOUT_ENFORCE_RIGHT_PADDING and x_center > x_limit:
+            continue
+        if kind == "bar":
+            value = bar_id
+        elif kind == "seq":
+            value = assembly_seq
+        elif kind == "len":
+            value = length_mm
+        else:
+            continue
+        _render_piece(kind, value, draw, x_center, y_center,
+                      regular_font, bold_font)
 
 
 def render_label_image(
-    row1: str, row2: str, height_px: int, tape_width_px: int,
+    bar_id: str, length_mm: int, assembly_seq: int,
+    height_px: int, tape_width_px: int,
 ) -> Image.Image:
-    """Render the two-row label using ``FONT_SIZE_PX`` for both rows."""
+    """Render the two-row grid label using ``FONT_SIZE_PX`` for both rows."""
     regular_font_path = _pick_font_path(REGULAR_FONT_CANDIDATES, "regular")
     bold_font_path = _pick_font_path(BOLD_FONT_CANDIDATES, "bold")
     regular_font = ImageFont.truetype(regular_font_path, FONT_SIZE_PX)
     bold_font = ImageFont.truetype(bold_font_path, FONT_SIZE_PX)
 
     img = Image.new("L", (tape_width_px, height_px), 255)
-    row_height = (height_px - ROW_GAP_PX) // 2
-    _draw_row_left_aligned(
-        img, row1, regular_font, bold_font, BAR_ID, 0, row_height,
-    )
-    _draw_row_left_aligned(
-        img, row2, regular_font, bold_font, BAR_ID,
-        row_height + ROW_GAP_PX, row_height,
-    )
+    row_height = (height_px - LAYOUT_ROW_GAP_PX) / 2.0
+    _draw_grid_row(img, row_index=0, bar_id=str(bar_id),
+                   length_mm=int(length_mm),
+                   assembly_seq=int(assembly_seq),
+                   regular_font=regular_font, bold_font=bold_font,
+                   row_top_px=0.0, row_height_px=row_height)
+    _draw_grid_row(img, row_index=1, bar_id=str(bar_id),
+                   length_mm=int(length_mm),
+                   assembly_seq=int(assembly_seq),
+                   regular_font=regular_font, bold_font=bold_font,
+                   row_top_px=row_height + LAYOUT_ROW_GAP_PX,
+                   row_height_px=row_height)
     return img
 
 
@@ -460,7 +394,6 @@ def main() -> int:
     # so the printer doesn't keep unprinted leftover inside the head.
     image_len_mm = TAPE_LENGTH_MM - LENGTH_CALIBRATION_MM
     label_len_px = mm_to_dots(image_len_mm)
-    row1, row2 = build_row_texts(BAR_ID, BAR_LENGTH_MM, ASSEMBLY_SEQ)
 
     print()
     print(f"Tube dia.   : {TUBE_DIAMETER_MM} mm  (circumf. "
@@ -469,12 +402,17 @@ def main() -> int:
           f"(image {image_len_mm:.1f} mm = {label_len_px} dots @ {DPI} dpi)")
     print(f"Strip h.    : {print_height_px} px")
     print(f"Font size   : {FONT_SIZE_PX} px")
-    print(f"Row 1       : {row1!r}")
-    print(f"Row 2       : {row2!r}")
+    print(f"Layout      : 2 rows x {LAYOUT_COLUMNS} cols, pattern={LAYOUT_PATTERN}")
+    print(f"Bar id      : {BAR_ID}")
+    print(f"Length      : {BAR_LENGTH_MM} mm")
+    print(f"Seq         : #{ASSEMBLY_SEQ}")
     print()
 
     # 4. Render
-    img = render_label_image(row1, row2, print_height_px, label_len_px)
+    img = render_label_image(
+        BAR_ID, BAR_LENGTH_MM, ASSEMBLY_SEQ,
+        print_height_px, label_len_px,
+    )
 
     # Save a copy next to this script so we can inspect what was sent.
     preview_path = Path(__file__).with_name("label_preview.png")
