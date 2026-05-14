@@ -198,7 +198,10 @@ pip install -r requirements.txt
 |------------|--------------------------------------------|
 | pymodbus   | Modbus RTU communication (motor + sensor)  |
 | pyserial   | Serial port enumeration and auto-detection |
-| Pillow     | JPEG joint reference images in the GUI     |
+| Pillow     | GUI images and label image rendering       |
+| pyusb      | USB transport for Brother label printer    |
+| libusb     | Windows libusb backend for PyUSB           |
+| brother_pt | Brother PT-P750W print protocol            |
 
 All dependencies are listed in `requirements.txt`.
 
