@@ -62,6 +62,26 @@
                 "type": "ground",
                 "ori": "N",
                 "offset_mm": 25.0
+            },
+            {
+                "type": "T20SubLeft_Female",
+                "ori": "P",
+                "offset_mm": 20.0
+            },
+            {
+                "type": "T20SubLeft_Female",
+                "ori": "N",
+                "offset_mm": 20.0
+            },
+            {
+                "type": "T20SubRight_Female",
+                "ori": "P",
+                "offset_mm": 20.0
+            },
+            {
+                "type": "T20SubRight_Female",
+                "ori": "N",
+                "offset_mm": 20.0
             }
         ]
     },
@@ -97,6 +117,26 @@
                 "type": "ground",
                 "ori": "N",
                 "rel_path": "ground_N.jpg"
+            },
+            {
+                "type": "T20SubLeft_Female",
+                "ori": "P",
+                "rel_path": "T20SubLeft_Female_P.jpg"
+            },
+            {
+                "type": "T20SubLeft_Female",
+                "ori": "N",
+                "rel_path": "T20SubLeft_Female_N.jpg"
+            },
+            {
+                "type": "T20SubRight_Female",
+                "ori": "P",
+                "rel_path": "T20SubRight_Female_P.jpg"
+            },
+            {
+                "type": "T20SubRight_Female",
+                "ori": "N",
+                "rel_path": "T20SubRight_Female_N.jpg"
             }
         ]
     },
