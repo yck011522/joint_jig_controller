@@ -187,9 +187,10 @@ Current method: manual labeling
 ## Environment Setup
 
 ```
-conda create -n joint_jig python=3.11 pip -c conda-forge
+conda create -n joint_jig python=3.10 pip -c conda-forge
 conda activate joint_jig
-pip install -r requirements.txt
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -r requirements.txt
 ```
 
 ### Dependencies
@@ -201,9 +202,15 @@ pip install -r requirements.txt
 | Pillow     | GUI images and label image rendering       |
 | pyusb      | USB transport for Brother label printer    |
 | libusb     | Windows libusb backend for PyUSB           |
+| packbits   | Compression dependency used by brother_pt  |
 | brother_pt | Brother PT-P750W print protocol            |
 
 All dependencies are listed in `requirements.txt`.
+
+### Python Version Note
+
+The label printer library `brother_pt==1.0` pins `Pillow==8.4.0`.
+For reliable installation, use Python 3.10 for this project environment.
 
 ## 4.1 Supervisory Control Software (Python)
 

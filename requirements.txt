@@ -1,6 +1,7 @@
 pymodbus==3.9
 pyserial>=3.5
-Pillow==12.2.0
+Pillow==8.4.0
 pyusb==1.3.1
 libusb==1.0.29.post7
+packbits==0.6
 brother_pt==1.0
