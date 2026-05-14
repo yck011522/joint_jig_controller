@@ -207,6 +207,29 @@ python -m pip install -r requirements.txt
 
 All dependencies are listed in `requirements.txt`.
 
+### Windows USB Driver Replacement for Brother Printer (WinUSB)
+
+For `pyusb` / `brother_pt` access on Windows, the Brother printer often
+needs to use a generic USB driver such as **WinUSB**.
+
+Recommended tool: **Zadig**
+
+- Official page: https://zadig.akeo.ie/
+- Direct download (current at time of writing):
+  https://github.com/pbatard/libwdi/releases/download/v1.5.1/zadig-2.9.exe
+- Usage guide: https://github.com/pbatard/libwdi/wiki/Zadig
+
+Quick steps:
+
+1. Connect and power on the Brother printer.
+2. Run `zadig-2.9.exe` as Administrator.
+3. In Zadig, enable **Options -> List All Devices**.
+4. Select the Brother printer USB device (double-check the selected device).
+5. Choose **WinUSB** as the target driver.
+6. Click **Replace Driver** (or **Install Driver**).
+
+After replacement, restart the app and re-check printer detection.
+
 ### Python Version Note
 
 The label printer library `brother_pt` is installed from its GitHub repository via `requirements.txt`.
