@@ -52,6 +52,16 @@
                 "type": "T20_Female",
                 "ori": "N",
                 "offset_mm": 10.0
+            },
+            {
+                "type": "ground",
+                "ori": "P",
+                "offset_mm": 25.0
+            },
+            {
+                "type": "ground",
+                "ori": "N",
+                "offset_mm": 25.0
             }
         ]
     },
